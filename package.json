@@ -1,0 +1,43 @@
+{
+  "name": "voice-ai",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev:worker": "wrangler dev --local",
+    "dev:client": "vite",
+    "dev": "concurrently -n worker,client -c cyan,magenta \"npm run dev:worker\" \"npm run dev:client\"",
+    "build": "vite build",
+    "deploy": "npm run build && wrangler deploy",
+    "db:migrate:local": "wrangler d1 execute voice-ai-db --local --file=db/0001_initial.sql",
+    "db:migrate:remote": "wrangler d1 execute voice-ai-db --remote --file=db/0001_initial.sql",
+    "db:upgrade:config:local": "wrangler d1 execute voice-ai-db --local --file=db/0002_user_profile_config.sql",
+    "db:upgrade:config:remote": "wrangler d1 execute voice-ai-db --remote --file=db/0002_user_profile_config.sql"
+  },
+  "dependencies": {
+    "@radix-ui/react-dialog": "^1.0.5",
+    "@ricky0123/vad-react": "^0.0.36",
+    "class-variance-authority": "^0.7.0",
+    "clsx": "^2.1.1",
+    "hono": "^4.0.0",
+    "lucide-react": "^1.17.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwind-merge": "^2.3.0",
+    "tailwindcss-animate": "^1.0.7",
+    "zustand": "^5.0.14"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260607.1",
+    "@types/node": "^20.19.42",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "autoprefixer": "^10.4.19",
+    "concurrently": "^8.2.2",
+    "postcss": "^8.4.38",
+    "tailwindcss": "^3.4.3",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.11",
+    "wrangler": "^4.98.0"
+  }
+}
