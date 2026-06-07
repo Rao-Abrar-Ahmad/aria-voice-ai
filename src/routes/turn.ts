@@ -68,4 +68,89 @@ app.post('/', async (c) => {
   })
 })
 
+// WebSocket /ws/turn
+app.get('/ws', async (c) => {
+  // Create a WebSocketPair (Cloudflare Workers)
+  const pair = new WebSocketPair()
+  const [client, server] = Object.values(pair)
+
+  server.accept()
+
+  // Streamed audio chunks will be accumulated here until finalization.
+  const chunks: Uint8Array[] = []
+  let sessionId = ''
+  let guestId = ''
+
+  server.addEventListener('message', async (evt: any) => {
+    try {
+      const data = typeof evt.data === 'string' ? JSON.parse(evt.data) : null
+      if (!data) return
+
+      if (data.type === 'init') {
+        sessionId = data.session_id
+        guestId = data.guest_id
+        server.send(JSON.stringify({ type: 'status', status: 'ws_opened' }))
+        return
+      }
+
+      if (data.type === 'audio_chunk') {
+        // Expect base64-encoded PCM frame
+        const b64 = data.payload
+        const bytes = Uint8Array.from(atob(b64), (c: any) => c.charCodeAt(0))
+        chunks.push(bytes)
+        // Ack receipt
+        server.send(JSON.stringify({ type: 'ack', received: bytes.length }))
+        return
+      }
+
+      if (data.type === 'end') {
+        // Combine chunks and run pipeline in background
+        const totalLen = chunks.reduce((s, c) => s + c.length, 0)
+        const combined = new Uint8Array(totalLen)
+        let offset = 0
+        for (const cbuf of chunks) {
+          combined.set(cbuf, offset)
+          offset += cbuf.length
+        }
+
+        // Fire-and-forget pipeline; send status updates via the socket
+        c.executionCtx.waitUntil((async () => {
+          try {
+            // For now call runAIPipeline with full audioBuffer; runAIPipeline may emit events via provided onEvent
+            await runAIPipeline({
+              ai: c.env.AI,
+              db: c.env.DB,
+              audioBuffer: combined.buffer,
+              history: [],
+              aiConfig: undefined,
+              sessionId,
+              onEvent: (event, payload) => {
+                try {
+                  server.send(JSON.stringify({ type: 'sse', event, payload }))
+                } catch (e) {
+                  console.error('Failed to send event over ws', e)
+                }
+              },
+            } as any)
+          } catch (err: any) {
+            server.send(JSON.stringify({ type: 'error', message: err?.message || String(err) }))
+          }
+        })())
+
+        server.send(JSON.stringify({ type: 'status', status: 'processing_started' }))
+        return
+      }
+    } catch (err) {
+      console.error('WS handler error', err)
+      try { server.send(JSON.stringify({ type: 'error', message: String(err) })) } catch (_) {}
+    }
+  })
+
+  server.addEventListener('close', () => {
+    // Cleanup
+  })
+
+  return new Response(null, { status: 101, webSocket: client })
+})
+
 export { app as turnRoute }

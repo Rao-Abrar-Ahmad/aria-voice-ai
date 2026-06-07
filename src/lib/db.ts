@@ -175,3 +175,32 @@ export async function upsertAiConfig(
 
   return { user_name, custom_instructions }
 }
+
+export async function insertTiming(
+  db: D1Database,
+  sessionId: string,
+  stage: string,
+  start: number,
+  end: number,
+  duration_ms: number
+) {
+  try {
+    await db.prepare(`CREATE TABLE IF NOT EXISTS timings (
+      id TEXT PRIMARY KEY, session_id TEXT NOT NULL, stage TEXT NOT NULL,
+      start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )`).run()
+  } catch (e) {
+    // ignore if table exists (older SQLite versions may not allow IF NOT EXISTS inside a transaction)
+  }
+
+  const id = crypto.randomUUID()
+  try {
+    await db.prepare(
+      'INSERT INTO timings (id, session_id, stage, start_ts, end_ts, duration_ms) VALUES (?, ?, ?, ?, ?, ?)'
+    ).bind(id, sessionId, stage, start, end, duration_ms).run()
+  } catch (e) {
+    console.warn('insertTiming failed', e)
+  }
+  return { id, sessionId, stage, start, end, duration_ms }
+}

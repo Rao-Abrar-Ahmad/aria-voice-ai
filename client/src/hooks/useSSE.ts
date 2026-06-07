@@ -3,8 +3,10 @@ import { useCallback } from 'react'
 type SSEHandlers = {
   onStatus: (state: string) => void
   onTranscriptUser: (text: string) => void
+  onTranscriptPartial?: (text: string) => void
   onTranscriptAI: (text: string) => void
   onAudio: (base64: string, format: string) => void
+  onTiming?: (payload: { stage: string; start: number; end: number; duration_ms: number }) => void
   onError: (message: string) => void
   onDone: () => void
 }
@@ -63,8 +65,14 @@ export function useSSE() {
               case 'status':
                 handlers.onStatus(parsed.state)
                 break
+              case 'transcript_partial':
+                handlers.onTranscriptPartial && handlers.onTranscriptPartial(parsed.text)
+                break
               case 'transcript_user':
                 handlers.onTranscriptUser(parsed.text)
+                break
+              case 'timing':
+                handlers.onTiming && handlers.onTiming(parsed)
                 break
               case 'transcript_ai':
                 handlers.onTranscriptAI(parsed.text)

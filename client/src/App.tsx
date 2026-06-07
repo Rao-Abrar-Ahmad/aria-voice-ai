@@ -1,10 +1,11 @@
-import { useState, useRef, useCallback, type MutableRefObject } from 'react'
+import { useState, useRef, useCallback, useEffect, type MutableRefObject } from 'react'
 import { WaveformCanvas } from './components/WaveformCanvas'
 import { Controls } from './components/Controls'
 import { LandingPopup } from './components/LandingPopup'
 import { SettingsPopup } from './components/SettingsPopup'
 import { TranscriptPanel, type TranscriptMessage } from './components/TranscriptPanel'
 import { useVAD } from './hooks/useVAD'
+import useWS from './hooks/useWS'
 import { useSession } from './hooks/useSession'
 import { useSSE } from './hooks/useSSE'
 import { Settings, PanelRight } from 'lucide-react'
@@ -17,6 +18,13 @@ export default function App() {
   const [showTranscript, setShowTranscript] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [messages, setMessages] = useState<TranscriptMessage[]>([])
+  const [timings, setTimings] = useState<Record<string, { start: number; end: number; duration_ms: number }>>({})
+  const timingsRef = useRef<Record<string, { start: number; end: number; duration_ms: number }>>(timings)
+
+  // keep a ref copy of timings for handlers invoked from callbacks/WS to avoid stale closures
+  useEffect(() => {
+    timingsRef.current = timings
+  }, [timings])
   const [showLanding, setShowLanding] = useState(true)
   const [initializing, setInitializing] = useState(false)
 
@@ -34,6 +42,8 @@ export default function App() {
 
   const { sessionId, initSession, getGuestId } = useSession()
   const { sendTurn } = useSSE()
+  const { connect: wsConnect, connected: wsConnected, sendAudioChunk, endStream, close: closeWS } = useWS()
+  const wsMessageHandlerRef = useRef<((msg: any) => void) | null>(null)
 
   const stopMicFeedback = useCallback(() => {
     if (micSourceRef.current) {
@@ -76,33 +86,55 @@ export default function App() {
 
     try {
       console.log('handleSpeechEnd: sending turn to backend')
-      await sendTurn(float32ToWav(audio), sessionId, getGuestId(), {
-        onStatus: (state) => {
-          console.log('SSE onStatus', state)
+
+      // Shared handlers for both WS and SSE paths
+      const handlers = {
+        onStatus: (state: string) => {
+          console.log('onStatus', state)
           if (state === 'transcribing') setConvState('transcribing')
           if (state === 'thinking') setConvState('thinking')
           if (state === 'speaking') setConvState('speaking')
         },
-        onTranscriptUser: (text) => {
-          console.log('SSE onTranscriptUser', text)
-          setMessages((m) => [...m, { id: crypto.randomUUID(), role: 'user', text }])
+        onTranscriptUser: (text: string) => {
+          console.log('onTranscriptUser', text)
+          setMessages((prev) => {
+            const last = prev[prev.length - 1]
+            if (last && last.role === 'user' && last.interim) {
+              return [...prev.slice(0, prev.length - 1), { id: crypto.randomUUID(), role: 'user', text }]
+            }
+            return [...prev, { id: crypto.randomUUID(), role: 'user', text }]
+          })
         },
-        onTranscriptAI: (text) => {
-          console.log('SSE onTranscriptAI', text)
-          setMessages((m) => [...m, { id: crypto.randomUUID(), role: 'assistant', text }])
+        onTranscriptAI: (text: string) => {
+          console.log('onTranscriptAI', text)
+          // compute total duration from collected timing stages (snapshot via ref)
+          const stages = timingsRef.current || {}
+          const total = Object.values(stages).reduce((acc, v) => acc + (v.duration_ms || 0), 0)
+          const stage_timings: Record<string, number> = Object.fromEntries(Object.entries(stages).map(([k, v]) => [k, v.duration_ms || 0]))
+          setMessages((m) => [...m, { id: crypto.randomUUID(), role: 'assistant', text, duration_ms: total, stage_timings }])
+          // reset timings for next turn
+          setTimings({})
         },
-        onAudio: (base64) => {
-          console.log('SSE onAudio received', { base64Length: base64.length })
+        onTiming: (payload: any) => {
+          try {
+            setTimings((t) => ({ ...t, [payload.stage]: { start: payload.start, end: payload.end, duration_ms: payload.duration_ms } }))
+            console.log('Timing event', payload)
+          } catch (e) {
+            console.warn('onTiming handler error', e)
+          }
+        },
+        onAudio: (base64: string) => {
+          console.log('onAudio received', { base64Length: base64.length })
           audioPlayPromise = playBase64Audio(base64, audioCtxRef, analyserRef, currentAudioSourceRef)
         },
-        onError: (message) => {
+        onError: (message: string) => {
           hadTurnError = true
           conversationActiveRef.current = false
-          console.error('SSE Pipeline error:', message)
+          console.error('Pipeline error:', message)
           setConvState('idle')
         },
         onDone: async () => {
-          console.log('SSE onDone')
+          console.log('onDone')
           await audioPlayPromise
           turnInProgressRef.current = false
           if (!hadTurnError && conversationActiveRef.current) {
@@ -111,7 +143,67 @@ export default function App() {
             setConvState('listening')
           }
         },
-      })
+      }
+
+      if (wsConnected) {
+        // Set the message handler to route incoming WS messages to our handlers
+        wsMessageHandlerRef.current = (msg: any) => {
+          try {
+            if (!msg) return
+            if (msg.type === 'sse') {
+              const ev = msg.event
+              const payload = msg.payload
+              if (ev === 'status') handlers.onStatus(payload.state)
+              if (ev === 'transcript_partial') {
+                const text = payload.text
+                setMessages((prev) => {
+                  const last = prev[prev.length - 1]
+                  if (last && last.role === 'user' && last.interim) {
+                    // replace last interim
+                    return [...prev.slice(0, prev.length - 1), { ...last, text }]
+                  }
+                  // append new interim
+                  return [...prev, { id: crypto.randomUUID(), role: 'user', text, interim: true }]
+                })
+              }
+              if (ev === 'transcript_user') handlers.onTranscriptUser(payload.text)
+              if (ev === 'timing') handlers.onTiming && handlers.onTiming(payload)
+              if (ev === 'transcript_ai') handlers.onTranscriptAI(payload.text)
+              if (ev === 'audio') handlers.onAudio(payload.data)
+              if (ev === 'done') handlers.onDone()
+            }
+            if (msg.type === 'error') handlers.onError(msg.message)
+          } catch (e) {
+            console.error('WS message handling error', e)
+          }
+        }
+
+        // Send the audio as a single chunk for now
+        const pcm = float32To16BitPCMBytes(audio)
+        const sent = sendAudioChunk(pcm)
+        if (!sent) throw new Error('WebSocket not ready to send audio')
+        endStream()
+      } else {
+        // Fallback to existing SSE endpoint
+        await sendTurn(float32ToWav(audio), sessionId, getGuestId(), {
+          onStatus: handlers.onStatus,
+          onTranscriptPartial: (text: string) => {
+            setMessages((prev) => {
+              const last = prev[prev.length - 1]
+              if (last && last.role === 'user' && last.interim) {
+                return [...prev.slice(0, prev.length - 1), { ...last, text }]
+              }
+              return [...prev, { id: crypto.randomUUID(), role: 'user', text, interim: true }]
+            })
+          },
+          onTranscriptUser: handlers.onTranscriptUser,
+          onTiming: handlers.onTiming,
+          onTranscriptAI: handlers.onTranscriptAI,
+          onAudio: handlers.onAudio,
+          onError: handlers.onError,
+          onDone: handlers.onDone,
+        })
+      }
     } catch (err) {
       console.error('Error in speech end flow:', err)
       conversationActiveRef.current = false
@@ -143,6 +235,15 @@ export default function App() {
     try {
       await startVAD()
       console.log('handleStart: VAD started, listening state')
+      // Open websocket connection for streaming if possible
+      try {
+        wsConnect({ sessionId: sessionId!, guestId: getGuestId() }, (msg) => {
+          const h = wsMessageHandlerRef.current
+          if (h) h(msg)
+        })
+      } catch (e) {
+        console.warn('Could not open WebSocket for streaming', e)
+      }
       setConvState('listening')
     } catch (err) {
       console.error('handleStart: VAD failed to start', err)
@@ -252,6 +353,18 @@ export default function App() {
                 <Settings size={18} />
               </button>
             </div>
+            <div className="ml-4 text-right text-xs text-zinc-500 dark:text-zinc-400">
+              {Object.keys(timings).length > 0 && (
+                <div className="flex gap-3 items-center">
+                  {Object.entries(timings).map(([stage, v]) => (
+                    <div key={stage} className="px-2 py-1 bg-zinc-50 dark:bg-zinc-800 rounded-md border border-zinc-100 dark:border-zinc-700 text-[11px]">
+                      <strong className="block text-[10px] text-zinc-600 dark:text-zinc-300">{stage}</strong>
+                      <span className="font-mono text-xs">{v.duration_ms}ms</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </header>
 
           <main className="flex-1 w-full max-w-lg flex flex-col items-center justify-center gap-8 py-12">
@@ -353,4 +466,14 @@ function float32ToWav(samples: Float32Array, sampleRate = 16000): Blob {
   }
 
   return new Blob([buffer], { type: 'audio/wav' })
+}
+
+function float32To16BitPCMBytes(samples: Float32Array): Uint8Array {
+  const buffer = new ArrayBuffer(samples.length * 2)
+  const view = new DataView(buffer)
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]))
+    view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true)
+  }
+  return new Uint8Array(buffer)
 }

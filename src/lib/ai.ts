@@ -13,7 +13,7 @@ interface PipelineOptions {
   db: D1Database;
   audioBuffer: ArrayBuffer;
   history: Message[];
-  aiConfig: AiConfig;
+  aiConfig?: AiConfig;
   sessionId: string;
   onEvent: SSEEvent;
 }
@@ -97,11 +97,34 @@ export async function runAIPipeline({
 
   onEvent("status", { state: "transcribing" });
   console.log("AI pipeline status: transcribing");
+  const now = () => Date.now()
+  const emitTiming = (stage: string, start: number, end: number) => {
+    try {
+        const payload = { stage, start, end, duration_ms: end - start }
+        onEvent('timing', payload)
+        // persist timing asynchronously
+        try {
+          ;(async () => {
+            // insertTiming may fail; do not block main flow
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { insertTiming } = await import('./db')
+            await insertTiming(db as any, sessionId, stage, start, end, end - start)
+          })()
+        } catch (e) {
+          console.warn('Failed to persist timing', e)
+        }
+    } catch (e) {
+      console.warn('Failed to emit timing event', e)
+    }
+  }
 
   try {
+    const sttStart = now()
     const sttResult = (await ai.run("@cf/openai/whisper", {
       audio: [...new Uint8Array(audioBuffer)],
     })) as any;
+    const sttEnd = now()
+    emitTiming('stt', sttStart, sttEnd)
     userTranscript = sttResult?.text?.trim();
     console.log("STT result", { userTranscript });
   } catch (err: any) {
@@ -129,6 +152,22 @@ export async function runAIPipeline({
     return;
   }
 
+  // Emit progressive partial transcripts (scaffold) to provide interim updates to clients.
+  try {
+    const words = userTranscript.split(/\s+/).filter(Boolean)
+    if (words.length > 1) {
+      let acc = ''
+      for (let i = 0; i < words.length; i++) {
+        acc = (acc + ' ' + words[i]).trim()
+        onEvent('transcript_partial', { text: acc })
+        // short pause to allow client to display interim text
+        await new Promise((r) => setTimeout(r, 60))
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to emit partial transcripts', e)
+  }
+
   console.log("sending user transcript to history and AI", {
     userTranscript,
     sessionId,
@@ -138,7 +177,7 @@ export async function runAIPipeline({
 
   onEvent("status", { state: "thinking" });
   console.log("AI pipeline status: thinking");
-
+  const llmStart = now()
   const messages: Message[] = [
     ...history,
     { role: "user", content: userTranscript },
@@ -151,6 +190,8 @@ export async function runAIPipeline({
     const turnCount = Math.floor(history.length / 2) + 1;
     const namePart = aiConfig.user_name ? `, ${aiConfig.user_name}` : "";
     aiResponseText = `Hello${namePart}. This is a mock voice response. I can see ${history.length} previous messages, and this is turn number ${turnCount}.`;
+    const llmEnd = now()
+    emitTiming('llm', llmStart, llmEnd)
   } else {
     try {
       const llmResult = (await ai.run("@cf/meta/llama-3.1-8b-instruct", {
@@ -160,6 +201,8 @@ export async function runAIPipeline({
       })) as any;
       aiResponseText = llmResult?.response?.trim();
       console.log("LLM response received", { aiResponseText });
+      const llmEnd = now()
+      emitTiming('llm', llmStart, llmEnd)
     } catch (err: any) {
       onEvent("error", { message: `LLM error: ${err.message || err}` });
       console.error("LLM error", err);
@@ -173,8 +216,11 @@ export async function runAIPipeline({
 
   let audioData = "";
 
+  const ttsStart = now()
   if (fallbackMode) {
     audioData = generateMockWavBase64(1.5, 400);
+    const ttsEnd = now()
+    emitTiming('tts', ttsStart, ttsEnd)
   } else {
     try {
       const ttsResult = (await ai.run("@cf/myshell-ai/melotts", {
@@ -184,6 +230,8 @@ export async function runAIPipeline({
       console.log("TTS result received", {
         audioDataLength: audioData?.length ?? 0,
       });
+      const ttsEnd = now()
+      emitTiming('tts', ttsStart, ttsEnd)
     } catch (err: any) {
       onEvent("error", { message: `TTS error: ${err.message || err}` });
       console.error("TTS error", err);
