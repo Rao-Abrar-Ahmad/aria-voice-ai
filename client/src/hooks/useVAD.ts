@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { MicVAD } from '@ricky0123/vad-web'
 
-const VAD_WORKLET_URL = new URL('../vad-assets/vad.worklet.bundle.min.js', import.meta.url).href
-const VAD_ASSET_BASE_PATH = VAD_WORKLET_URL.replace(/vad\.worklet\.bundle\.min\.js$/, '')
+const VAD_WORKLET_URL = new URL('../vad-assets/vad.worklet.bundle.js', import.meta.url).href
+const VAD_ASSET_BASE_PATH = VAD_WORKLET_URL.replace(/vad\.worklet\.bundle(?:\.min)?\.js$/, '')
 
 console.log('useVAD config', {
   VAD_WORKLET_URL,
