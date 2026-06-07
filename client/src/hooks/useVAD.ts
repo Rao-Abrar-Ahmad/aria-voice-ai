@@ -1,27 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { MicVAD } from '@ricky0123/vad-web'
 
-const VAD_WORKLET_URL = new URL('../vad-assets/vad.worklet.bundle.js', import.meta.url).href
-const VAD_ASSET_BASE_PATH = VAD_WORKLET_URL.replace(/vad\.worklet\.bundle(?:\.min)?\.js$/, '')
+// VAD assets hosted on jsDelivr CDN
+const ONNX_WASM_BASE_PATH = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/'
+const VAD_ASSET_BASE_PATH = 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/'
 
-console.log('useVAD config', {
-  VAD_WORKLET_URL,
+console.log('useVAD config (CDN-based)', {
+  ONNX_WASM_BASE_PATH,
   VAD_ASSET_BASE_PATH,
 })
-
-const _vadAssetUrls = [
-  new URL('../vad-assets/ort-wasm-simd-threaded.mjs', import.meta.url).href,
-  new URL('../vad-assets/ort-wasm-simd-threaded.asyncify.mjs', import.meta.url).href,
-  new URL('../vad-assets/ort-wasm-simd-threaded.jspi.mjs', import.meta.url).href,
-  new URL('../vad-assets/ort-wasm-simd-threaded.wasm', import.meta.url).href,
-  new URL('../vad-assets/ort-wasm-simd-threaded.asyncify.wasm', import.meta.url).href,
-  new URL('../vad-assets/ort-wasm-simd-threaded.jspi.wasm', import.meta.url).href,
-  new URL('../vad-assets/silero_vad.onnx', import.meta.url).href,
-  new URL('../vad-assets/silero_vad_legacy.onnx', import.meta.url).href,
-  new URL('../vad-assets/vad.worklet.bundle.js', import.meta.url).href,
-  VAD_WORKLET_URL,
-]
-void _vadAssetUrls
 
 export function useVAD(onSpeechEnd: (audio: Float32Array) => void) {
   const vadRef = useRef<InstanceType<typeof MicVAD> | null>(null)
@@ -61,8 +48,7 @@ export function useVAD(onSpeechEnd: (audio: Float32Array) => void) {
         startOnLoad: false,
         model: 'legacy',
         baseAssetPath: VAD_ASSET_BASE_PATH,
-        onnxWASMBasePath: VAD_ASSET_BASE_PATH,
-        workletURL: VAD_WORKLET_URL,
+        onnxWASMBasePath: ONNX_WASM_BASE_PATH,
         getStream: async () => {
           return await navigator.mediaDevices.getUserMedia({
             audio: {
