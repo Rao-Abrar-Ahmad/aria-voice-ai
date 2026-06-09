@@ -1,9 +1,11 @@
 import type { Ai } from '@cloudflare/workers-types'
 import type { AiConfig, Message } from '../types'
 
+const default_systemPrompt = `You are Aria, a warm and intelligent voice assistant. You speak in a natural, conversational tone - as if talking to a friend. Keep responses concise: 1-2 sentences unless more detail is genuinely needed. Never use markdown, bullet points, headers, or lists. Respond in plain flowing sentences only, since your words will be spoken aloud. Don't use question marks, punctuation. Don't ask counter questions. Just talk short friendly. NOTE: Never say you are a ai assistant or any ai model. Always tell your identity as Aria. Don't Sound Like a Robot. Don't say how can i help you or any kind of greeting questions. Just respond to the user's query.`
+
 export async function* runLLM(ai: Ai, history: Message[], config: AiConfig): AsyncGenerator<string, string> {
   const result = (await ai.run('@cf/meta/llama-3.1-8b-instruct', {
-    messages: [{ role: 'system', content: config.system_prompt }, ...history],
+    messages: [{ role: 'system', content: default_systemPrompt }, ...history],
     max_tokens: 300,
     temperature: 0.7,
   })) as any
@@ -19,12 +21,69 @@ export async function* runLLM(ai: Ai, history: Message[], config: AiConfig): Asy
 }
 
 export async function runTTS(ai: Ai, text: string) {
-  const result = (await ai.run('@cf/deepgram/aura-1', {
-    text,
-  })) as any
+  const result = (await ai.run(
+    '@cf/deepgram/aura-1',
+    {
+      text,
+      speaker: 'asteria',
+      encoding: 'mp3',
+    },
+    {
+      returnRawResponse: true,
+    },
+  )) as unknown
 
   return {
-    data: typeof result === 'string' ? result : result?.audio ?? result?.body ?? result?.data ?? '',
+    data: await audioResultToBase64(result),
     format: 'mp3',
   }
+}
+
+async function audioResultToBase64(result: unknown): Promise<string> {
+  if (!result) return ''
+
+  if (typeof result === 'string') {
+    return result
+  }
+
+  if (result instanceof Response) {
+    return arrayBufferToBase64(await result.arrayBuffer())
+  }
+
+  if (result instanceof ReadableStream) {
+    return streamToBase64(result)
+  }
+
+  if (result instanceof ArrayBuffer) {
+    return arrayBufferToBase64(result)
+  }
+
+  if (ArrayBuffer.isView(result)) {
+    return arrayBufferToBase64(result.buffer.slice(result.byteOffset, result.byteOffset + result.byteLength))
+  }
+
+  const value = result as {
+    audio?: unknown
+    body?: unknown
+    data?: unknown
+  }
+
+  return audioResultToBase64(value.audio ?? value.body ?? value.data)
+}
+
+async function streamToBase64(stream: ReadableStream) {
+  const response = new Response(stream)
+  return arrayBufferToBase64(await response.arrayBuffer())
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer) {
+  const bytes = new Uint8Array(buffer)
+  let binary = ''
+
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    const chunk = bytes.subarray(index, index + 0x8000)
+    binary += String.fromCharCode(...chunk)
+  }
+
+  return btoa(binary)
 }
