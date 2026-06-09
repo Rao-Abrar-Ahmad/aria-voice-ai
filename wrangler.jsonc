@@ -2,24 +2,43 @@
   "name": "vad-voice-ai",
   "main": "src/index.ts",
   "compatibility_date": "2024-09-23",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application"
   },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "VOICE_SESSION",
+        "class_name": "VoiceSession"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": [
+        "VoiceSession"
+      ]
+    }
+  ],
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "voice-ai-db",
-      "database_id": "3a6ee8ec-6927-421a-b292-e9f0c3a73dd0"
+      "database_id": "6d3c04f0-c497-4745-bc44-6e240071aa9e"
     }
   ],
   "ai": {
     "binding": "AI"
   },
   "vars": {
-    "ENVIRONMENT": "production"
+    "ENVIRONMENT": "production",
+    "COOKIE_SECRET": "change-me-in-production"
   },
   "env": {
     "development": {

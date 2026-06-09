@@ -32,7 +32,7 @@
     --input: 240 5.9% 90%;
     --ring: 240 5.9% 10%;
  
-    --radius: 1rem;
+    --radius: 0.5rem;
   }
  
   .dark {
@@ -89,16 +89,70 @@
   @apply bg-muted;
 }
 
-/* Waveform canvas glowing container */
-.waveform-glow {
-  box-shadow: 0 0 40px -10px rgba(99, 102, 241, 0.15);
-  transition: box-shadow 0.5s ease-in-out;
+.persona-orb {
+  position: relative;
+  display: grid;
+  width: min(48vw, 18rem);
+  aspect-ratio: 1;
+  place-items: center;
+  border-radius: 9999px;
+  background:
+    radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.95), transparent 18%),
+    radial-gradient(circle at 50% 52%, rgba(20, 184, 166, 0.95), rgba(14, 116, 144, 0.82) 48%, rgba(63, 63, 70, 0.24) 72%);
+  box-shadow: 0 28px 90px rgba(15, 118, 110, 0.22);
+  transition: filter 240ms ease, transform 240ms ease;
 }
 
-.waveform-glow.listening {
-  box-shadow: 0 0 50px -5px rgba(99, 102, 241, 0.3);
+.persona-core {
+  width: 42%;
+  aspect-ratio: 1;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.82);
+  filter: blur(2px);
 }
 
-.waveform-glow.speaking {
-  box-shadow: 0 0 50px -5px rgba(16, 185, 129, 0.3);
+.persona-ring {
+  position: absolute;
+  inset: 12%;
+  border: 1px solid rgba(255, 255, 255, 0.42);
+  border-radius: 9999px;
+}
+
+.persona-ring-two {
+  inset: 24%;
+  border-color: rgba(255, 255, 255, 0.3);
+}
+
+.persona-listening {
+  animation: personaPulse 1.8s ease-in-out infinite;
+}
+
+.persona-thinking .persona-ring-one {
+  animation: personaSpin 3.4s linear infinite;
+  border-style: dashed;
+}
+
+.persona-speaking {
+  animation: personaSpeak 850ms ease-in-out infinite alternate;
+  background:
+    radial-gradient(circle at 34% 28%, rgba(255, 255, 255, 0.95), transparent 18%),
+    radial-gradient(circle at 50% 52%, rgba(244, 114, 182, 0.9), rgba(20, 184, 166, 0.82) 52%, rgba(39, 39, 42, 0.2) 74%);
+}
+
+.persona-error {
+  filter: saturate(0.7);
+}
+
+@keyframes personaPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.035); }
+}
+
+@keyframes personaSpeak {
+  from { transform: scale(0.985); }
+  to { transform: scale(1.045); }
+}
+
+@keyframes personaSpin {
+  to { transform: rotate(360deg); }
 }

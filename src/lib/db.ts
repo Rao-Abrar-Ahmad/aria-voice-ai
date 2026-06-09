@@ -1,206 +1,152 @@
 import type { D1Database } from '@cloudflare/workers-types'
+import type { AiConfig, Message, Session, User } from '../types'
 
-const LEGACY_DEFAULT_SYSTEM_PROMPT =
-  'You are a helpful voice assistant. Keep responses concise and conversational, suitable for being spoken aloud. Avoid markdown, bullet points, or any formatting - respond in plain spoken sentences only.'
+const DEFAULT_AI_CONFIG: AiConfig = {
+  ai_name: 'Aria',
+  system_prompt:
+    'You are Aria, a warm and intelligent voice assistant. You speak in a natural, conversational tone - as if talking to a friend. Keep responses concise: 1-3 sentences unless more detail is genuinely needed. Never use markdown, bullet points, headers, or lists. Respond in plain flowing sentences only, since your words will be spoken aloud.',
+}
 
-async function ensureAiConfigSchema(db: D1Database) {
-  const info = await db.prepare(`PRAGMA table_info(ai_configs)`).all<any>()
-  const columns = (info.results ?? []).map((row: any) => row.name)
+type UserWithNewFlag = User & { is_new: boolean }
 
-  if (columns.length === 0) {
-    console.log('ensureAiConfigSchema: ai_configs table missing, creating table')
+async function ensureV2Schema(db: D1Database) {
+  const messageInfo = await db.prepare('PRAGMA table_info(messages)').all<any>()
+  const messageColumns = (messageInfo.results ?? []).map((row: any) => row.name)
+
+  if (messageColumns.includes('transcript') && !messageColumns.includes('content')) {
+    await db.prepare("ALTER TABLE messages ADD COLUMN content TEXT NOT NULL DEFAULT ''").run()
+    await db.prepare("UPDATE messages SET content = transcript WHERE content = ''").run()
+  }
+
+  const configInfo = await db.prepare('PRAGMA table_info(ai_configs)').all<any>()
+  const configColumns = (configInfo.results ?? []).map((row: any) => row.name)
+
+  if (configColumns.length === 0) {
     await db.prepare(
       `CREATE TABLE IF NOT EXISTS ai_configs (
-        id            TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))), 
+        id            TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
         user_id       TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-        ai_name       TEXT NOT NULL DEFAULT 'Assistant',
-        system_prompt TEXT NOT NULL DEFAULT '${LEGACY_DEFAULT_SYSTEM_PROMPT.replace(/'/g, "''")}',
-        user_name     TEXT NOT NULL DEFAULT '',
-        custom_instructions TEXT NOT NULL DEFAULT '',
+        ai_name       TEXT NOT NULL DEFAULT 'Aria',
+        system_prompt TEXT NOT NULL DEFAULT '${DEFAULT_AI_CONFIG.system_prompt.replace(/'/g, "''")}',
         updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
-      )`
-    ).run()
-    return
-  }
-
-  if (!columns.includes('user_name')) {
-    console.log('ensureAiConfigSchema: adding missing column user_name to ai_configs')
-    await db.prepare(
-      "ALTER TABLE ai_configs ADD COLUMN user_name TEXT NOT NULL DEFAULT ''"
-    ).run()
-  }
-
-  if (!columns.includes('custom_instructions')) {
-    console.log('ensureAiConfigSchema: adding missing column custom_instructions to ai_configs')
-    await db.prepare(
-      "ALTER TABLE ai_configs ADD COLUMN custom_instructions TEXT NOT NULL DEFAULT ''"
+      )`,
     ).run()
   }
 }
 
 export async function upsertUser(
   db: D1Database,
-  { guest_id, email }: { guest_id: string; email?: string }
-) {
-  let user = await db.prepare('SELECT * FROM users WHERE guest_id = ?')
-    .bind(guest_id).first<any>()
+  { guest_id, email }: { guest_id: string; email?: string },
+): Promise<UserWithNewFlag> {
+  let user = await db.prepare('SELECT * FROM users WHERE guest_id = ?').bind(guest_id).first<User>()
+
+  if (!user && email) {
+    user = await db.prepare('SELECT * FROM users WHERE email = ?').bind(email).first<User>()
+    if (user) {
+      await db.prepare('UPDATE users SET guest_id = ? WHERE id = ?').bind(guest_id, user.id).run()
+      return { ...user, guest_id, is_new: false }
+    }
+  }
 
   if (!user) {
-    if (email) {
-      user = await db.prepare('SELECT * FROM users WHERE email = ?')
-        .bind(email).first<any>()
-      if (user) {
-        await db.prepare('UPDATE users SET guest_id = ? WHERE id = ?')
-          .bind(guest_id, user.id).run()
-        return { ...user, is_new: false }
-      }
-    }
-
     const id = crypto.randomUUID()
-    await db.prepare('INSERT INTO users (id, email, guest_id) VALUES (?, ?, ?)')
-      .bind(id, email ?? null, guest_id).run()
-    user = await db.prepare('SELECT * FROM users WHERE id = ?').bind(id).first<any>()
-    return { ...user, is_new: true }
+    await db.prepare('INSERT INTO users (id, email, guest_id) VALUES (?, ?, ?)').bind(id, email ?? null, guest_id).run()
+    const created = await db.prepare('SELECT * FROM users WHERE id = ?').bind(id).first<User>()
+    if (!created) throw new Error('Failed to create user')
+    return { ...created, is_new: true }
   }
 
   if (email && !user.email) {
-    await db.prepare('UPDATE users SET email = ? WHERE id = ?')
-      .bind(email, user.id).run()
-    user.email = email
+    await db.prepare('UPDATE users SET email = ? WHERE id = ?').bind(email, user.id).run()
+    user = { ...user, email }
   }
 
   return { ...user, is_new: false }
 }
 
-export async function getOrCreateSession(db: D1Database, userId: string) {
+export async function getOrCreateSession(db: D1Database, userId: string): Promise<Session> {
   let session = await db
     .prepare('SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at ASC LIMIT 1')
-    .bind(userId).first<any>()
+    .bind(userId)
+    .first<Session>()
 
   if (!session) {
     const id = crypto.randomUUID()
-    await db.prepare('INSERT INTO sessions (id, user_id) VALUES (?, ?)')
-      .bind(id, userId).run()
-    session = await db.prepare('SELECT * FROM sessions WHERE id = ?')
-      .bind(id).first<any>()
+    await db.prepare('INSERT INTO sessions (id, user_id) VALUES (?, ?)').bind(id, userId).run()
+    session = await db.prepare('SELECT * FROM sessions WHERE id = ?').bind(id).first<Session>()
   }
 
+  if (!session) throw new Error('Failed to create session')
   return session
 }
 
-export async function loadHistory(db: D1Database, sessionId: string, limit = 20) {
-  const rows = await db.prepare(
-    `SELECT role, transcript FROM messages
-     WHERE session_id = ?
-     ORDER BY created_at DESC
-     LIMIT ?`
-  ).bind(sessionId, limit).all<any>()
-
-  return (rows.results ?? []).reverse().map(r => ({
-    role: r.role as 'user' | 'assistant',
-    content: r.transcript,
-  }))
+export async function getSessionBySessionId(db: D1Database, sessionId: string) {
+  return db.prepare('SELECT * FROM sessions WHERE id = ?').bind(sessionId).first<Session>()
 }
 
-export async function insertMessage(
-  db: D1Database,
-  sessionId: string,
-  role: 'user' | 'assistant',
-  transcript: string
-) {
+export async function loadHistory(db: D1Database, sessionId: string, limit = 50): Promise<Message[]> {
+  await ensureV2Schema(db)
+  const rows = await db
+    .prepare(
+      `SELECT role, content FROM messages
+       WHERE session_id = ?
+       ORDER BY created_at DESC
+       LIMIT ?`,
+    )
+    .bind(sessionId, limit)
+    .all<Message>()
+
+  return (rows.results ?? []).reverse()
+}
+
+export async function insertMessage(db: D1Database, sessionId: string, role: Message['role'], content: string) {
+  await ensureV2Schema(db)
   const id = crypto.randomUUID()
-  await db.prepare(
-    'INSERT INTO messages (id, session_id, role, transcript) VALUES (?, ?, ?, ?)'
-  ).bind(id, sessionId, role, transcript).run()
-  return { id, role, transcript }
+  await db
+    .prepare('INSERT INTO messages (id, session_id, role, content) VALUES (?, ?, ?, ?)')
+    .bind(id, sessionId, role, content)
+    .run()
+  return { id, role, content }
 }
 
-export async function getUserByGuestId(db: D1Database, guestId: string) {
-  return db.prepare('SELECT * FROM users WHERE guest_id = ?')
-    .bind(guestId).first<any>()
+export async function getAiConfig(db: D1Database, userId: string): Promise<AiConfig> {
+  await ensureV2Schema(db)
+  const config = await db
+    .prepare('SELECT ai_name, system_prompt FROM ai_configs WHERE user_id = ?')
+    .bind(userId)
+    .first<AiConfig>()
+
+  if (config) return config
+
+  const id = crypto.randomUUID()
+  await db
+    .prepare('INSERT INTO ai_configs (id, user_id, ai_name, system_prompt) VALUES (?, ?, ?, ?)')
+    .bind(id, userId, DEFAULT_AI_CONFIG.ai_name, DEFAULT_AI_CONFIG.system_prompt)
+    .run()
+
+  return DEFAULT_AI_CONFIG
 }
 
-export async function getAiConfig(db: D1Database, userId: string) {
-  await ensureAiConfigSchema(db)
-  const config = await db.prepare('SELECT * FROM ai_configs WHERE user_id = ?')
-    .bind(userId).first<any>()
-
-  if (!config) {
-    return {
-      user_name: '',
-      custom_instructions: '',
-    }
+export async function upsertAiConfig(db: D1Database, userId: string, config: AiConfig): Promise<AiConfig> {
+  await ensureV2Schema(db)
+  const normalized: AiConfig = {
+    ai_name: config.ai_name.trim() || DEFAULT_AI_CONFIG.ai_name,
+    system_prompt: config.system_prompt.trim() || DEFAULT_AI_CONFIG.system_prompt,
   }
 
-  const legacySystemPrompt = typeof config.system_prompt === 'string' ? config.system_prompt : ''
-  const legacyCustomInstructions =
-    legacySystemPrompt && !legacySystemPrompt.startsWith('You are a helpful voice assistant.')
-      ? legacySystemPrompt
-      : ''
-
-  return {
-    user_name: config.user_name ?? '',
-    custom_instructions: config.custom_instructions ?? legacyCustomInstructions,
-    ai_name: config.ai_name ?? 'Assistant',
-    system_prompt: config.system_prompt ?? LEGACY_DEFAULT_SYSTEM_PROMPT,
-  }
-}
-
-export async function upsertAiConfig(
-  db: D1Database,
-  userId: string,
-  {
-    user_name,
-    custom_instructions,
-  }: { user_name: string; custom_instructions: string }
-) {
-  await ensureAiConfigSchema(db)
-  const existing = await db.prepare('SELECT id FROM ai_configs WHERE user_id = ?')
-    .bind(userId).first<any>()
-
+  const existing = await db.prepare('SELECT id FROM ai_configs WHERE user_id = ?').bind(userId).first<{ id: string }>()
   if (existing) {
-    await db.prepare(
-      `UPDATE ai_configs
-       SET user_name = ?, custom_instructions = ?, updated_at = datetime('now')
-       WHERE user_id = ?`
-    ).bind(user_name, custom_instructions, userId).run()
+    await db
+      .prepare("UPDATE ai_configs SET ai_name = ?, system_prompt = ?, updated_at = datetime('now') WHERE user_id = ?")
+      .bind(normalized.ai_name, normalized.system_prompt, userId)
+      .run()
   } else {
     const id = crypto.randomUUID()
-    await db.prepare(
-      `INSERT INTO ai_configs
-       (id, user_id, ai_name, system_prompt, user_name, custom_instructions)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    ).bind(id, userId, 'Assistant', LEGACY_DEFAULT_SYSTEM_PROMPT, user_name, custom_instructions).run()
+    await db
+      .prepare('INSERT INTO ai_configs (id, user_id, ai_name, system_prompt) VALUES (?, ?, ?, ?)')
+      .bind(id, userId, normalized.ai_name, normalized.system_prompt)
+      .run()
   }
 
-  return { user_name, custom_instructions }
-}
-
-export async function insertTiming(
-  db: D1Database,
-  sessionId: string,
-  stage: string,
-  start: number,
-  end: number,
-  duration_ms: number
-) {
-  try {
-    await db.prepare(`CREATE TABLE IF NOT EXISTS timings (
-      id TEXT PRIMARY KEY, session_id TEXT NOT NULL, stage TEXT NOT NULL,
-      start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )`).run()
-  } catch (e) {
-    // ignore if table exists (older SQLite versions may not allow IF NOT EXISTS inside a transaction)
-  }
-
-  const id = crypto.randomUUID()
-  try {
-    await db.prepare(
-      'INSERT INTO timings (id, session_id, stage, start_ts, end_ts, duration_ms) VALUES (?, ?, ?, ?, ?, ?)'
-    ).bind(id, sessionId, stage, start, end, duration_ms).run()
-  } catch (e) {
-    console.warn('insertTiming failed', e)
-  }
-  return { id, sessionId, stage, start, end, duration_ms }
+  return normalized
 }

@@ -7,11 +7,11 @@ export default defineConfig({
   plugins: [react()],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, 'client/src')
-    }
+      '@': path.resolve(__dirname, 'client/src'),
+    },
   },
   build: {
-    outDir: '../dist',   // builds into project root dist/
+    outDir: '../dist',
     emptyOutDir: true,
     rollupOptions: {
       output: {
@@ -21,17 +21,16 @@ export default defineConfig({
   },
   server: {
     port: 5173,
-    // Required for Silero VAD WASM — SharedArrayBuffer needs a secure cross-origin context
-    headers: {
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
-    },
     proxy: {
-      // In local dev: forward /api/* to the Worker running on :8787
       '/api': {
         target: 'http://localhost:8787',
         changeOrigin: true,
-      }
-    }
-  }
+      },
+      '/ws': {
+        target: 'ws://localhost:8787',
+        ws: true,
+        changeOrigin: true,
+      },
+    },
+  },
 })
