@@ -6,3 +6,7 @@ dist
 .wrangler
 .kilo
 .vscode
+.wsl
+.wrangler
+dist
+.npm

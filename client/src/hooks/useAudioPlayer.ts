@@ -10,10 +10,10 @@ export function useAudioPlayer(onEnded: () => void) {
     audioRef.current = null
   }, [])
 
-  const play = useCallback(
-    async (base64: string, format = 'mp3') => {
+  const playSource = useCallback(
+    async (source: string) => {
       stop()
-      const audio = new Audio(`data:audio/${format};base64,${base64}`)
+      const audio = new Audio(source)
       audioRef.current = audio
       audio.onended = onEnded
       await audio.play()
@@ -21,5 +21,19 @@ export function useAudioPlayer(onEnded: () => void) {
     [onEnded, stop],
   )
 
-  return { play, stop }
+  const play = useCallback(
+    async (base64: string, format = 'mp3') => {
+      await playSource(`data:audio/${format};base64,${base64}`)
+    },
+    [playSource],
+  )
+
+  const playUrl = useCallback(
+    async (url: string) => {
+      await playSource(url)
+    },
+    [playSource],
+  )
+
+  return { play, playUrl, stop }
 }

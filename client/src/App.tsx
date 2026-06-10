@@ -12,6 +12,9 @@ import { useVoiceWebSocket } from './hooks/useVoiceWebSocket'
 import { useVoiceStore } from './store/voiceStore'
 import 'regenerator-runtime/runtime'
 
+const GREETING_TEXT = "Hi, I'm Aria. How's your day going?"
+const GREETING_AUDIO_URL = '/audio/aria-greeting.mp3'
+
 export default function App() {
   const [showLanding, setShowLanding] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -25,11 +28,22 @@ export default function App() {
   const setConvState = useVoiceStore((state) => state.setConvState)
   const setInterimText = useVoiceStore((state) => state.setInterimText)
   const setError = useVoiceStore((state) => state.setError)
+  const addMessage = useVoiceStore((state) => state.addMessage)
   const resetConversation = useVoiceStore((state) => state.resetConversation)
   const { startSession, restoreSession } = useVoiceSession()
   const notifyAudioDoneRef = useRef<() => void>(() => {})
+  const greetingPlayedRef = useRef(false)
+  const playingGreetingRef = useRef(false)
 
   const handleAudioEnded = useCallback(() => {
+    if (playingGreetingRef.current) {
+      playingGreetingRef.current = false
+      if (useVoiceStore.getState().active) {
+        setConvState('listening')
+      }
+      return
+    }
+
     notifyAudioDoneRef.current()
     if (useVoiceStore.getState().active) {
       setConvState('listening')
@@ -101,10 +115,26 @@ export default function App() {
 
     socket.connect()
     setActive(true)
-    setConvState('listening')
+
+    if (greetingPlayedRef.current) {
+      setConvState('listening')
+      return
+    }
+
+    greetingPlayedRef.current = true
+    playingGreetingRef.current = true
+    addMessage({ id: crypto.randomUUID(), role: 'assistant', content: GREETING_TEXT })
+    setConvState('speaking')
+
+    void audio.playUrl(GREETING_AUDIO_URL).catch(() => {
+      playingGreetingRef.current = false
+      setConvState('listening')
+      setError('Greeting audio is missing. Run npm run generate:greeting to create it.')
+    })
   }
 
   const handleEndConversation = () => {
+    playingGreetingRef.current = false
     audio.stop()
     socket.close()
     resetConversation()
