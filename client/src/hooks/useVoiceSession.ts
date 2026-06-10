@@ -1,8 +1,12 @@
-import { useCallback, useMemo } from 'react'
-import { initSession, loadConfig, loadHistory } from '../lib/api'
+import { useCallback } from 'react'
+import { checkSession, initSession, loadConfig, loadHistory } from '../lib/api'
 import { useVoiceStore } from '../store/voiceStore'
 
 const GUEST_ID_KEY = 'voice-ai.guest-id'
+
+function getStoredGuestId() {
+  return localStorage.getItem(GUEST_ID_KEY)
+}
 
 function getOrCreateGuestId() {
   const existing = localStorage.getItem(GUEST_ID_KEY)
@@ -18,10 +22,22 @@ export function useVoiceSession() {
   const setMessages = useVoiceStore((state) => state.setMessages)
   const setConfig = useVoiceStore((state) => state.setConfig)
 
-  const guestId = useMemo(() => getOrCreateGuestId(), [])
+  const restoreSession = useCallback(async () => {
+    const session = await checkSession(getStoredGuestId() ?? undefined)
+    if (!session) return null
+
+    setSession(session.session_id, session.user_id)
+
+    const [history, config] = await Promise.allSettled([loadHistory(), loadConfig()])
+    if (history.status === 'fulfilled') setMessages(history.value)
+    if (config.status === 'fulfilled') setConfig(config.value)
+
+    return session
+  }, [setConfig, setMessages, setSession])
 
   const startSession = useCallback(
     async (email?: string) => {
+      const guestId = getOrCreateGuestId()
       const session = await initSession(guestId, email)
       setSession(session.session_id, session.user_id)
 
@@ -31,9 +47,8 @@ export function useVoiceSession() {
 
       return session
     },
-    [guestId, setConfig, setMessages, setSession],
+    [setConfig, setMessages, setSession],
   )
 
-  return { guestId, startSession }
+  return { guestId: getStoredGuestId(), startSession, restoreSession }
 }
-

@@ -41,3 +41,14 @@ export async function saveConfig(config: AiConfig) {
   return response.json() as Promise<AiConfig>
 }
 
+export async function checkSession(guestId?: string): Promise<SessionResponse | null> {
+  const response = await fetch('/api/session/check', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(guestId ? { guest_id: guestId } : {}),
+  })
+
+  if (!response.ok) return null
+  return response.json() as Promise<SessionResponse>
+}

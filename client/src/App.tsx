@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Mic } from 'lucide-react'
 import { ConversationControls } from './components/ConversationControls'
 import { LandingPopup } from './components/LandingPopup'
@@ -9,12 +9,13 @@ import { useAudioPlayer } from './hooks/useAudioPlayer'
 import { useSpeechInput } from './hooks/useSpeechRecognition'
 import { useVoiceSession } from './hooks/useVoiceSession'
 import { useVoiceWebSocket } from './hooks/useVoiceWebSocket'
-import { useVoiceStore } from './store/voiceStore';
-import 'regenerator-runtime/runtime';
+import { useVoiceStore } from './store/voiceStore'
+import 'regenerator-runtime/runtime'
 
 export default function App() {
-  const [showLanding, setShowLanding] = useState(true)
+  const [showLanding, setShowLanding] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [checkingSession, setCheckingSession] = useState(true)
   const [initializing, setInitializing] = useState(false)
   const active = useVoiceStore((state) => state.active)
   const convState = useVoiceStore((state) => state.convState)
@@ -25,8 +26,8 @@ export default function App() {
   const setInterimText = useVoiceStore((state) => state.setInterimText)
   const setError = useVoiceStore((state) => state.setError)
   const resetConversation = useVoiceStore((state) => state.resetConversation)
-  const { startSession } = useVoiceSession()
-  const notifyAudioDoneRef = useRef<() => void>(() => { })
+  const { startSession, restoreSession } = useVoiceSession()
+  const notifyAudioDoneRef = useRef<() => void>(() => {})
 
   const handleAudioEnded = useCallback(() => {
     notifyAudioDoneRef.current()
@@ -57,6 +58,27 @@ export default function App() {
   )
 
   const speech = useSpeechInput(active && convState === 'listening', handleFinalTranscript)
+
+  useEffect(() => {
+    let cancelled = false
+
+    const checkExistingSession = async () => {
+      try {
+        const session = await restoreSession()
+        if (!cancelled) setShowLanding(!session)
+      } catch {
+        if (!cancelled) setShowLanding(true)
+      } finally {
+        if (!cancelled) setCheckingSession(false)
+      }
+    }
+
+    checkExistingSession()
+
+    return () => {
+      cancelled = true
+    }
+  }, [restoreSession])
 
   const handleLandingContinue = async (email?: string) => {
     setInitializing(true)
@@ -90,7 +112,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen overflow-hidden bg-zinc-50 text-zinc-950 transition-colors dark:bg-zinc-950 dark:text-zinc-50">
-      <LandingPopup open={showLanding} onContinue={handleLandingContinue} />
+      <LandingPopup open={!checkingSession && showLanding} onContinue={handleLandingContinue} />
       <SettingsPopup open={showSettings} onClose={() => setShowSettings(false)} />
 
       {initializing && (
@@ -105,7 +127,7 @@ export default function App() {
           <PersonaView />
           <button
             onClick={handleStartConversation}
-            disabled={showLanding || initializing}
+            disabled={checkingSession || showLanding || initializing}
             className="inline-flex items-center gap-2 rounded-full bg-teal-600 px-8 py-4 text-base font-semibold text-white shadow-lg shadow-teal-600/20 transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <Mic size={20} />

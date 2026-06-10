@@ -22,9 +22,9 @@ export function PersonaView() {
       </div>
       <div className="min-h-[4.5rem] max-w-md px-4">
         <p className="text-sm font-semibold uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">{aiName}</p>
-        {convState != 'idle' && <p className="mt-2 text-lg font-medium text-zinc-900 dark:text-zinc-50">{stateLabel[convState]}</p>}
+        {convState != 'idle' && <p className="mt-2 text-lg font-medium text-zinc-900 dark:text-zinc-50 hidden">{stateLabel[convState]}</p>}
         {interimText && convState === 'listening' && (
-          <p className="mt-3 text-sm leading-6 text-zinc-500 dark:text-zinc-400">{interimText}</p>
+          <p className="mt-3 text-sm leading-6 text-zinc-500 dark:text-zinc-400 hidden">{interimText}</p>
         )}
       </div>
     </div>
