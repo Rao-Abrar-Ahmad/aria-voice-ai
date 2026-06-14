@@ -31,7 +31,7 @@ export default function App() {
   const addMessage = useVoiceStore((state) => state.addMessage)
   const resetConversation = useVoiceStore((state) => state.resetConversation)
   const { startSession, restoreSession } = useVoiceSession()
-  const notifyAudioDoneRef = useRef<() => void>(() => {})
+  const notifyAudioDoneRef = useRef<() => void>(() => { })
   const greetingPlayedRef = useRef(false)
   const playingGreetingRef = useRef(false)
 
@@ -169,14 +169,14 @@ export default function App() {
           )}
         </main>
       ) : (
-        <main className={`flex h-screen overflow-hidden ${showTranscript ? 'sm:flex-row' : 'flex-col'}`}>
-          {showTranscript && (
-            <aside className="hidden h-full w-80 shrink-0 border-r border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 sm:block">
-              <TranscriptPanel />
-            </aside>
-          )}
+        <main className={`w-full flex h-screen overflow-hidden flex-row`}>
 
-          <section className="flex flex-1 flex-col items-center justify-between px-5 py-6 sm:px-8 sm:py-10">
+          <aside className={` h-full bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-950 opacity-50 ${showTranscript ? 'w-80 shrink-0' : '-translate-x-full absolute'} transition-all duration-300 ease-in-out`}>
+            <TranscriptPanel type='desktop' />
+          </aside>
+
+
+          <section className="h-full w-full flex basis-full flex-1 flex-col items-center justify-center px-5 py-6 sm:px-8 sm:py-10">
             {/* <div className="flex w-full justify-end gap-2">
               <button
                 onClick={() => setShowSettings(true)}

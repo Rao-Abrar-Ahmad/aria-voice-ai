@@ -3,10 +3,9 @@ node_modules
 
 dist
 
-.wrangler
 .kilo
 .vscode
 .wsl
-.wrangler
 dist
 .npm
+.wrangler

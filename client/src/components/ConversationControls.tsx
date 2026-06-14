@@ -16,7 +16,7 @@ export function ConversationControls({ onEnd, onSettingsOpen }: Props) {
       <button
         type="button"
         onClick={() => setShowTranscript(!showTranscript)}
-        className="hidden sm:inline-flex h-11 w-11 items-center justify-center rounded-full border border-zinc-200 bg-white text-zinc-600 shadow-sm transition hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+        className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-zinc-200 bg-white text-zinc-600 shadow-sm transition hover:bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
         title="Toggle transcript"
       >
         <PanelLeft size={18} />
