@@ -11,7 +11,10 @@ export async function* runLLM(ai: Ai, history: Message[], config: AiConfig): Asy
     temperature: 0.7
   })) as any;
 
-  const response = (result?.response ?? '').trim()
+  // Qwen3 "thinking" models wrap chain-of-thought in <think>…</think> tags.
+  // Strip those blocks so we only keep the actual answer.
+  const raw = (result?.response ?? '').toString()
+  const response = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
   const chunks = response.match(/\S+\s*/g) ?? [response]
 
   for (const chunk of chunks) {
