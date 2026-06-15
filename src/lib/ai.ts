@@ -5,7 +5,7 @@ import { chatgpt_ai_system_prompt } from './example-system-prompts'
 const default_systemPrompt = chatgpt_ai_system_prompt;
 
 export async function* runLLM(ai: Ai, history: Message[], config: AiConfig): AsyncGenerator<string, string> {
-  const result = (await ai.run('@cf/meta/llama-3.1-8b-instruct', {
+  const result = (await ai.run('@cf/meta/llama-3.1-8b-instruct-fast', {
     messages: [{ role: 'system', content: default_systemPrompt }, ...history],
     max_tokens: 300,
     temperature: 0.7,
