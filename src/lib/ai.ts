@@ -8,7 +8,7 @@ export async function* runLLM(ai: Ai, history: Message[], config: AiConfig): Asy
   const result = (await ai.run('@cf/meta/llama-3.1-8b-instruct-fast', {
     messages: [{ role: 'system', content: default_systemPrompt }, ...history],
     max_tokens: 300,
-    temperature: 0.7,
+    temperature: 0.8,
   })) as any
 
   const response = (result?.response ?? '').trim()
