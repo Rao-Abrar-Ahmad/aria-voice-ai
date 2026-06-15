@@ -1,11 +1,9 @@
 # Voice AI — Complete Technical Specification
 
-> **Implementation update**: The app now targets a continuous turn-based voice call. After the user clicks Start once, VAD silence detection automatically submits each spoken turn, the AI response is played, and listening resumes until the user clicks End. Settings now store the user's preferred name and additional AI instructions, not an editable assistant name.
-
-> **Purpose**: End-to-end build specification for an AI agent or developer.  
-> **Stack**: React + TypeScript (frontend) · Cloudflare Workers + Hono (backend) · Cloudflare Workers AI (STT/LLM/TTS) · Cloudflare D1 (database) · Cloudflare Workers + Workers Assets (hosting)  
-> **Pattern**: Turn-based voice conversation with VAD silence detection, SSE streaming, persistent sessions, and a waveform UI.  
-> **Project model**: Single unified project — Vite builds the React SPA into `dist/`, Hono Worker lives in `src/`, one `wrangler.jsonc` deploys everything.
+> **Purpose**: End-to-end build specification for the Voice AI application.
+> **Stack**: React + TypeScript + Vite · Tailwind CSS · shadcn/ui · AI Elements · react-speech-recognition · Cloudflare Workers + Hono · Durable Objects (WebSocket) · Workers AI (LLM + TTS) · D1 · Workers Assets
+> **Architecture**: Sandwich voice pipeline — Browser Web Speech API (STT) → Cloudflare LLM → Cloudflare Deepgram Aura-1 (TTS)
+> **Project model**: Single unified project — one `package.json`, one `wrangler.jsonc`, one deploy command
 
 ---
 
@@ -13,15 +11,16 @@
 
 1. [System Overview](#1-system-overview)
 2. [Project Structure](#2-project-structure)
-3. [Database Schema (D1)](#3-database-schema-d1)
+3. [Database Schema — D1](#3-database-schema--d1)
 4. [Configuration — wrangler.jsonc](#4-configuration--wranlerjsonc)
-5. [Backend — Cloudflare Worker (Hono)](#5-backend--cloudflare-worker-hono)
+5. [Backend — Cloudflare Worker + Durable Object](#5-backend--cloudflare-worker--durable-object)
 6. [AI Pipeline](#6-ai-pipeline)
-7. [Frontend — React SPA](#7-frontend--react-spa)
-8. [Phase Build Plan](#8-phase-build-plan)
-9. [Environment & Local Dev](#9-environment--local-dev)
-10. [Deployment](#10-deployment)
-11. [ADRs — Architecture Decision Records](#11-adrs--architecture-decision-records)
+7. [WebSocket Message Protocol](#7-websocket-message-protocol)
+8. [Frontend — React SPA](#8-frontend--react-spa)
+9. [Phase Build Plan](#9-phase-build-plan)
+10. [Environment & Local Dev](#10-environment--local-dev)
+11. [Deployment](#11-deployment)
+12. [ADRs — Architecture Decision Records](#12-adrs--architecture-decision-records)
 
 ---
 
@@ -29,49 +28,91 @@
 
 ### What it does
 
-A single-page voice AI application where the user speaks, the AI listens, thinks, and speaks back. No text input required. Conversation history is persisted per user (identified by email or anonymous guest UUID) and survives page refresh.
+A single-page voice AI application. The user clicks "Start Conversation", speaks naturally, and the AI responds in a synthesized voice. No text input. No push-to-talk. The browser's Web Speech API detects speech and silence automatically. Conversation history is persisted per user and survives page refresh.
 
-### Turn-based pipeline
+### Sandwich architecture
 
 ```
-[Mic] → Silero VAD (silence detected) → Audio blob
-     → POST /api/turn (multipart)
-     → Worker: Whisper (STT) → SSE: "transcribing"
-     → Worker: Llama 3.1 8B (LLM) → SSE: "thinking"
-     → Worker: MeloTTS (TTS) → SSE: "speaking" + audio chunks
-     → Worker: save to D1 → SSE: "done" + transcript
-     → [Speaker plays AI audio]
-     → [Transcription panel updates]
+[User speaks]
+     │
+     ▼
+Web Speech API (browser-native STT)
+  → interimTranscript  ─────────────────► UI: live streaming text (left panel)
+  → finalTranscript fires on silence ──► WebSocket: send { type: "transcript", text }
+     │
+     ▼
+Cloudflare Durable Object (WebSocket connection)
+     │
+     ├─ emit { type: "status", state: "thinking" } ──► UI: Persona switches to "thinking"
+     │
+     ▼
+@cf/meta/llama-3.1-8b-instruct (LLM)
+  → system prompt applied
+  → full conversation history injected
+  → streams response text
+     │
+     ├─ emit { type: "llm_chunk", text } ──► UI: AI response appended to transcript
+     │
+     ▼
+@cf/deepgram/aura-1 (TTS)
+  → converts LLM response to natural speech audio
+     │
+     ├─ emit { type: "status", state: "speaking" } ──► UI: Persona switches to "speaking"
+     ├─ emit { type: "audio", data: base64, format: "mp3" } ──► Browser plays audio
+     │
+     ▼
+Audio playback complete
+     │
+     ├─ emit { type: "status", state: "idle" } ──► UI: Persona returns to "idle"
+     └─ mic resumes listening ──► ready for next turn
 ```
 
-### How the SPA is served
+### UI layout states
 
-The React SPA is built by Vite into `dist/`. The `wrangler.jsonc` `assets` binding points Cloudflare to that directory. Cloudflare serves static files directly from its CDN — no Hono route needed for the frontend. Hono only handles `/api/*` routes. All other paths fall through to the asset serving layer, which returns `index.html` (SPA fallback).
+**Before "Start Conversation" clicked**:
+```
+┌─────────────────────────────────────┐
+│                                     │
+│           [Persona orb]             │
+│                                     │
+│      [Start Conversation btn]       │
+│                                     │
+└─────────────────────────────────────┘
+Single centered column (hero)
+```
 
-### Key decisions (all resolved via grilling session)
+**After "Start Conversation" clicked (transcript hidden)**:
+```
+┌─────────────────────────────────────┐
+│  [≡ transcript toggle]  [settings]  │
+│                                     │
+│           [Persona orb]             │
+│         state-animated              │
+│                                     │
+│      [status label]  [End btn]      │
+└─────────────────────────────────────┘
+```
 
-| Decision | Choice | Reason |
-|---|---|---|
-| Voice mode | Turn-based (VAD) | Fits Worker request/response model; real-time duplex not yet stable on CF |
-| VAD library | `@ricky0123/vad-web` (Silero WASM) | Far more accurate than energy threshold in noisy environments |
-| AI provider | Cloudflare Workers AI only | Full CF-native stack; no external API keys needed |
-| STT model | `@cf/openai/whisper` | Best available on CF Workers AI |
-| LLM model | `@cf/meta/llama-3.1-8b-instruct` | Good quality, fast, free on CF |
-| TTS model | `@cf/myshell-ai/melotts` | English, CF-native |
-| Backend framework | Hono on CF Workers | Lightweight router, clean multi-route API |
-| AI SDK (Vercel) | Not used | Audio buffers don't benefit from text-stream abstraction |
-| Conversation history | Client sends full history each turn | Simpler; history also stored in D1 for persistence |
-| History persistence | Cloudflare D1 | Single CF platform; survives page refresh |
-| Guest identity | LocalStorage UUID | No auth needed; ties guest to a stable identity |
-| User identity | Email only (no password) | Lightweight identity; email stored in D1 |
-| Language | English only (v1) | Simplest; TTS voice can swap later |
-| Waveform style | Sine wave, 2-color canvas | User color vs AI color, premium feel, lightweight |
-| Frontend framework | React + TypeScript SPA | Component model fits state machine complexity |
-| UI library | Tailwind CSS + shadcn/ui | Familiar stack; shadcn for modals/popups |
-| Project model | Single unified project | One `package.json`, one `wrangler.jsonc`, one deploy |
-| Frontend serving | Workers Assets (CF-native CDN) | Recommended CF approach for full-stack Workers; no Pages needed |
-| Config format | `wrangler.jsonc` | Cloudflare's preferred format; supports comments |
-| Hosting | Cloudflare Workers | Everything on one Worker; no separate Pages project |
+**After transcript toggle clicked**:
+```
+┌────────────────┬────────────────────┐
+│  Conversation  │                    │
+│  ──────────── │   [Persona orb]    │
+│  You: Hello   │   state-animated   │
+│  AI: Hi there │                    │
+│  You: [live…] │  [status] [End]    │
+└────────────────┴────────────────────┘
+Two columns — transcript left, persona right
+```
+
+### Session persistence model
+
+- Every visitor gets a stable `guest_id` UUID stored in `localStorage`
+- On landing: popup asks for email or guest
+- `POST /api/session` is called with `{ guest_id, email? }` — creates or resumes user + session
+- Session cookie set by Worker (`Set-Cookie: session_id=...; HttpOnly; SameSite=Strict`)
+- WebSocket connection authenticated by `session_id` cookie on upgrade
+- On reconnect: D1 history loaded, conversation resumes seamlessly
 
 ---
 
@@ -79,171 +120,171 @@ The React SPA is built by Vite into `dist/`. The `wrangler.jsonc` `assets` bindi
 
 ```
 voice-ai/
-├── src/                              # Cloudflare Worker (Hono backend)
-│   ├── index.ts                      # Hono app entry, route registration
+├── src/                                  # Cloudflare Worker (backend)
+│   ├── index.ts                          # Hono entry — HTTP routes + WS upgrade
 │   ├── routes/
-│   │   ├── session.ts                # POST /api/session
-│   │   ├── turn.ts                   # POST /api/turn (SSE endpoint)
-│   │   ├── config.ts                 # GET|POST /api/config
-│   │   └── history.ts                # GET /api/history
+│   │   ├── session.ts                    # POST /api/session (create/resume)
+│   │   ├── history.ts                    # GET /api/history?session_id=
+│   │   └── config.ts                     # GET|POST /api/config
+│   ├── durable-objects/
+│   │   └── VoiceSession.ts               # Durable Object — WS + AI pipeline
 │   ├── lib/
-│   │   ├── ai.ts                     # Workers AI pipeline (STT → LLM → TTS)
-│   │   ├── db.ts                     # D1 query helpers
-│   │   └── sse.ts                    # SSE stream writer utility
-│   └── types.ts                      # Shared Worker TypeScript types
+│   │   ├── ai.ts                         # LLM + TTS pipeline helpers
+│   │   ├── db.ts                         # D1 query helpers
+│   │   └── session.ts                    # Session cookie helpers
+│   └── types.ts                          # Shared Worker TypeScript types
 │
-├── client/                           # React SPA (Vite source)
+├── client/                               # React SPA (Vite)
 │   ├── index.html
-│   ├── src/
-│   │   ├── main.tsx
-│   │   ├── App.tsx
-│   │   ├── components/
-│   │   │   ├── LandingPopup.tsx      # Email / guest entry modal
-│   │   │   ├── WaveformCanvas.tsx    # Sine wave visualizer
-│   │   │   ├── Controls.tsx          # Start/listening/end controls
-│   │   │   ├── SettingsPopup.tsx     # User preferred name + custom AI instructions modal
-│   │   │   ├── TranscriptPanel.tsx   # Chat-style transcript column
-│   │   │   └── StatusIndicator.tsx   # transcribing/thinking/speaking badge
-│   │   ├── hooks/
-│   │   │   ├── useVAD.ts             # Silero VAD integration
-│   │   │   ├── useAudioPlayer.ts     # Plays TTS audio blobs
-│   │   │   ├── useWaveform.ts        # Web Audio AnalyserNode → canvas
-│   │   │   ├── useSession.ts         # Session init, localStorage UUID
-│   │   │   └── useSSE.ts             # Reads SSE stream from /api/turn
-│   │   ├── store/
-│   │   │   └── conversationStore.ts  # Zustand: messages, status, config
-│   │   ├── lib/
-│   │   │   └── api.ts                # Typed fetch wrappers for Worker API
-│   │   └── types.ts
-│   └── public/
-│       ├── silero_vad.onnx           # Silero VAD WASM model (static asset)
-│       └── vad.worklet.bundle.js     # Silero VAD audio worklet bundle
+│   └── src/
+│       ├── main.tsx
+│       ├── App.tsx                       # Root layout, state machine, WS orchestration
+│       ├── components/
+│       │   ├── LandingPopup.tsx          # Email / guest modal on first visit
+│       │   ├── PersonaView.tsx           # AI Elements Persona + status label
+│       │   ├── TranscriptPanel.tsx       # AI Elements Conversation + Message thread
+│       │   ├── ConversationControls.tsx  # End button + transcript toggle + settings btn
+│       │   └── SettingsPopup.tsx         # System prompt / AI name config
+│       ├── hooks/
+│       │   ├── useVoiceSession.ts        # Session init, localStorage UUID, cookie
+│       │   ├── useSpeechRecognition.ts   # react-speech-recognition wrapper
+│       │   ├── useVoiceWebSocket.ts      # WebSocket connection + message dispatch
+│       │   └── useAudioPlayer.ts         # Plays base64 TTS audio, fires onEnd
+│       ├── store/
+│       │   └── voiceStore.ts             # Zustand: convState, messages, session, config
+│       ├── lib/
+│       │   └── api.ts                    # Typed fetch helpers for HTTP routes
+│       └── types.ts                      # Shared frontend types
 │
 ├── db/
-│   └── 0001_initial.sql              # D1 migration
+│   └── 0001_initial.sql                  # D1 migration
 │
-├── dist/                             # Vite build output → served by Workers Assets
+├── dist/                                 # Vite build output → Workers Assets
 │
-├── wrangler.jsonc                    # Single Cloudflare config for Worker + Assets
-├── vite.config.ts                    # Vite config (outDir: dist)
+├── wrangler.jsonc
+├── vite.config.ts
 ├── tailwind.config.ts
-├── tsconfig.json                     # Root TS config (Worker)
-├── tsconfig.client.json              # Client TS config (extends root)
-└── package.json                      # Single unified package.json
+├── tsconfig.json                         # Worker TS config
+├── tsconfig.client.json                  # Client TS config
+└── package.json
 ```
 
 ---
 
-## 3. Database Schema (D1)
+## 3. Database Schema — D1
 
-### Migration file: `db/0001_initial.sql`
+### `db/0001_initial.sql`
 
 ```sql
--- Users: email users and guests both get a row
+-- Users table: covers both email users and guests
 CREATE TABLE IF NOT EXISTS users (
   id          TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-  email       TEXT UNIQUE,           -- NULL for guests
-  guest_id    TEXT UNIQUE NOT NULL,  -- localStorage UUID, always present
+  email       TEXT UNIQUE,                -- NULL for guests
+  guest_id    TEXT UNIQUE NOT NULL,       -- localStorage UUID, stable across visits
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Sessions: one per user (single ongoing conversation model)
+-- Sessions table: one session per user (single ongoing conversation)
 CREATE TABLE IF NOT EXISTS sessions (
   id          TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Messages: all turns stored here
+-- Messages table: full conversation history
 CREATE TABLE IF NOT EXISTS messages (
   id          TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   role        TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
-  transcript  TEXT NOT NULL,
+  content     TEXT NOT NULL,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- AI persona config: user preferred name + custom instructions per user
+-- AI config: per-user AI name and system prompt
 CREATE TABLE IF NOT EXISTS ai_configs (
   id            TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   user_id       TEXT NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
-  ai_name       TEXT NOT NULL DEFAULT 'Assistant',
-  system_prompt TEXT NOT NULL DEFAULT 'You are a helpful voice assistant. Keep responses concise and conversational, suitable for being spoken aloud. Avoid markdown, bullet points, or any formatting — respond in plain spoken sentences only.',
-  user_name     TEXT NOT NULL DEFAULT '',
-  custom_instructions TEXT NOT NULL DEFAULT '',
+  ai_name       TEXT NOT NULL DEFAULT 'Aria',
+  system_prompt TEXT NOT NULL DEFAULT 'You are Aria, a warm and intelligent voice assistant. You speak in a natural, conversational tone — as if talking to a friend. Keep responses concise: 1–3 sentences unless more detail is genuinely needed. Never use markdown, bullet points, headers, or lists. Respond in plain flowing sentences only, since your words will be spoken aloud.',
   updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Indexes
-CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
-CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
-CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+-- Indexes for fast lookups
+CREATE INDEX IF NOT EXISTS idx_users_guest_id    ON users(guest_id);
+CREATE INDEX IF NOT EXISTS idx_users_email       ON users(email);
+CREATE INDEX IF NOT EXISTS idx_sessions_user_id  ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_messages_session  ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_messages_time     ON messages(created_at);
 ```
 
-**Context window strategy**: Load the last **20 messages** (10 turns) for LLM history. Keeps token usage manageable while preserving meaningful context.
+### Context window strategy
 
-### Migration file: `db/0002_user_profile_config.sql`
-
-Existing databases created before the user-profile config change must add:
-
-```sql
-ALTER TABLE ai_configs ADD COLUMN user_name TEXT NOT NULL DEFAULT '';
-ALTER TABLE ai_configs ADD COLUMN custom_instructions TEXT NOT NULL DEFAULT '';
-```
-
-The legacy `ai_name` and `system_prompt` columns remain for compatibility, but new app behavior uses `user_name` and `custom_instructions`.
+Load the last **30 messages** (15 turns) from D1 per turn. This gives the LLM meaningful context without overrunning the model's context window. Messages are ordered chronologically before injection.
 
 ---
 
 ## 4. Configuration — wrangler.jsonc
 
-`wrangler.jsonc` is Cloudflare's preferred config format. It supports comments (`//` and `/* */`) unlike plain JSON, making it easier to document bindings inline.
-
-### `wrangler.jsonc`
-
 ```jsonc
 {
-  // Worker name — becomes the subdomain: voice-ai.your-account.workers.dev
+  // Worker name → deployed at voice-ai.YOUR-ACCOUNT.workers.dev
   "name": "voice-ai",
 
-  // Worker entry point (Hono backend)
+  // Hono Worker entry point
   "main": "src/index.ts",
 
-  // Minimum compatibility date — keep up to date when adding new CF features
+  // Cloudflare recommended — enables Node.js built-ins (crypto, Buffer)
   "compatibility_date": "2024-09-23",
-
-  // nodejs_compat enables Node.js built-ins (crypto, Buffer, etc.) in Workers
   "compatibility_flags": ["nodejs_compat"],
 
-  // Workers Assets — Cloudflare serves the Vite build output as static files
-  // from its CDN. Non-API requests fall through to index.html (SPA fallback).
+  // Workers Assets: Vite build output served as static files from CF CDN
+  // not_found_handling ensures React Router / SPA works correctly
   "assets": {
     "directory": "./dist",
     "binding": "ASSETS",
-    // Serve index.html for all unmatched routes (React Router / SPA support)
     "not_found_handling": "single-page-application"
   },
+
+  // Durable Object: one instance per user session, holds WebSocket + state
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "VOICE_SESSION",       // accessed as env.VOICE_SESSION in Worker
+        "class_name": "VoiceSession"   // exported class name from src/durable-objects/VoiceSession.ts
+      }
+    ]
+  },
+
+  // Durable Object migration — required on first deploy and class rename
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["VoiceSession"]
+    }
+  ],
 
   // Cloudflare D1 — SQLite at the edge
   "d1_databases": [
     {
-      "binding": "DB",               // accessed as env.DB in Worker
+      "binding": "DB",
       "database_name": "voice-ai-db",
       "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
     }
   ],
 
-  // Cloudflare Workers AI
+  // Cloudflare Workers AI — STT (unused), LLM, TTS
   "ai": {
-    "binding": "AI"                  // accessed as env.AI in Worker
+    "binding": "AI"
   },
 
-  // Environment variables (non-secret)
+  // Non-secret environment variables
   "vars": {
-    "ENVIRONMENT": "production"
+    "ENVIRONMENT": "production",
+    // Used for signing session cookies — OVERRIDE via wrangler secret in prod
+    "COOKIE_SECRET": "change-me-in-production"
   },
 
-  // Local dev overrides — used by wrangler dev
+  // Local dev overrides
   "env": {
     "development": {
       "vars": {
@@ -254,16 +295,14 @@ The legacy `ai_name` and `system_prompt` columns remain for compatibility, but n
 }
 ```
 
-### Notes on `wrangler.jsonc` vs `wrangler.toml`
-
-- Cloudflare's own documentation and `wrangler init` scaffolding now defaults to `wrangler.jsonc`
-- JSONC (JSON with Comments) is the preferred format — it supports inline documentation
-- `wrangler.toml` still works but is considered legacy for new projects
-- Never use plain `wrangler.json` — no comment support makes it harder to document bindings
+> **Security note**: `COOKIE_SECRET` must be set as a Wrangler secret in production:
+> ```bash
+> npx wrangler secret put COOKIE_SECRET
+> ```
 
 ---
 
-## 5. Backend — Cloudflare Worker (Hono)
+## 5. Backend — Cloudflare Worker + Durable Object
 
 ### `src/types.ts`
 
@@ -271,46 +310,93 @@ The legacy `ai_name` and `system_prompt` columns remain for compatibility, but n
 export type Env = {
   DB: D1Database
   AI: Ai
-  ASSETS: Fetcher        // Workers Assets binding
+  ASSETS: Fetcher
+  VOICE_SESSION: DurableObjectNamespace
   ENVIRONMENT: string
+  COOKIE_SECRET: string
+}
+
+export type Message = {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export type AiConfig = {
+  ai_name: string
+  system_prompt: string
+}
+
+export type User = {
+  id: string
+  email: string | null
+  guest_id: string
+  created_at: string
+}
+
+export type Session = {
+  id: string
+  user_id: string
+  created_at: string
 }
 ```
 
-### `src/index.ts` — Hono app entry
+### `src/index.ts` — Hono entry point
 
 ```typescript
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { getCookie, setCookie } from 'hono/cookie'
 import { sessionRoute } from './routes/session'
-import { turnRoute } from './routes/turn'
-import { configRoute } from './routes/config'
 import { historyRoute } from './routes/history'
+import { configRoute } from './routes/config'
 import type { Env } from './types'
+
+// Re-export Durable Object class — required by Cloudflare
+export { VoiceSession } from './durable-objects/VoiceSession'
 
 const app = new Hono<{ Bindings: Env }>()
 
-// CORS is only needed during local dev (Vite on :5173, Worker on :8787)
-// In production, frontend and API are same origin — no CORS required
+// CORS only needed for local dev (Vite :5173 ↔ Worker :8787)
+// In production: same origin — no CORS needed
 app.use('/api/*', cors({
   origin: ['http://localhost:5173'],
   allowMethods: ['GET', 'POST', 'OPTIONS'],
   allowHeaders: ['Content-Type'],
+  credentials: true,
 }))
 
+// HTTP API routes
 app.route('/api/session', sessionRoute)
-app.route('/api/turn', turnRoute)
-app.route('/api/config', configRoute)
 app.route('/api/history', historyRoute)
+app.route('/api/config', configRoute)
+
+// WebSocket upgrade route
+// Client connects to /ws?session_id=SESSION_ID
+// Worker authenticates via session cookie, then forwards to Durable Object
+app.get('/ws', async (c) => {
+  const sessionId = getCookie(c, 'session_id')
+    ?? c.req.query('session_id')
+
+  if (!sessionId) {
+    return c.json({ error: 'No session' }, 401)
+  }
+
+  // Route to the Durable Object instance for this session
+  const id = c.env.VOICE_SESSION.idFromName(sessionId)
+  const stub = c.env.VOICE_SESSION.get(id)
+
+  // Forward the WebSocket upgrade to the Durable Object
+  return stub.fetch(c.req.raw)
+})
 
 export default app
 ```
-
-> **Note on CORS**: Because the React SPA and the Worker are deployed as the same origin (same `workers.dev` subdomain or custom domain), CORS headers are not needed in production. The `cors()` middleware is scoped to `/api/*` and only applies during local development when Vite runs on a different port.
 
 ### `src/routes/session.ts`
 
 ```typescript
 import { Hono } from 'hono'
+import { setCookie } from 'hono/cookie'
 import { upsertUser, getOrCreateSession } from '../lib/db'
 import type { Env } from '../types'
 
@@ -318,14 +404,30 @@ const app = new Hono<{ Bindings: Env }>()
 
 // POST /api/session
 // Body: { guest_id: string, email?: string }
-// Returns: { session_id, user_id, is_new_user }
+// Returns: { session_id, user_id, ai_name, is_new_user }
+// Sets: HttpOnly session_id cookie
 app.post('/', async (c) => {
-  const { guest_id, email } = await c.req.json<{ guest_id: string; email?: string }>()
+  const body = await c.req.json<{ guest_id: string; email?: string }>()
 
-  if (!guest_id) return c.json({ error: 'guest_id required' }, 400)
+  if (!body.guest_id) {
+    return c.json({ error: 'guest_id is required' }, 400)
+  }
 
-  const user = await upsertUser(c.env.DB, { guest_id, email })
+  const user = await upsertUser(c.env.DB, {
+    guest_id: body.guest_id,
+    email: body.email,
+  })
+
   const session = await getOrCreateSession(c.env.DB, user.id)
+
+  // Set persistent session cookie (7 days)
+  setCookie(c, 'session_id', session.id, {
+    httpOnly: true,
+    sameSite: 'Strict',
+    secure: c.env.ENVIRONMENT === 'production',
+    maxAge: 60 * 60 * 24 * 7, // 7 days
+    path: '/',
+  })
 
   return c.json({
     session_id: session.id,
@@ -337,263 +439,432 @@ app.post('/', async (c) => {
 export { app as sessionRoute }
 ```
 
-### `src/routes/turn.ts` — Main SSE endpoint
-
-```typescript
-import { Hono } from 'hono'
-import { runAIPipeline } from '../lib/ai'
-import { loadHistory, getUserByGuestId, getAiConfig } from '../lib/db'
-import type { Env } from '../types'
-
-const app = new Hono<{ Bindings: Env }>()
-
-// POST /api/turn
-// Body: multipart/form-data — audio: Blob, session_id: string, guest_id: string
-// Returns: SSE stream
-app.post('/', async (c) => {
-  const formData = await c.req.formData()
-  const audioBlob = formData.get('audio') as File
-  const sessionId = formData.get('session_id') as string
-  const guestId = formData.get('guest_id') as string
-
-  if (!audioBlob || !sessionId || !guestId) {
-    return c.json({ error: 'audio, session_id, and guest_id required' }, 400)
-  }
-
-  const user = await getUserByGuestId(c.env.DB, guestId)
-  if (!user) return c.json({ error: 'user not found' }, 404)
-
-  const [history, aiConfig] = await Promise.all([
-    loadHistory(c.env.DB, sessionId, 20),
-    getAiConfig(c.env.DB, user.id),
-  ])
-
-  const audioBuffer = await audioBlob.arrayBuffer()
-
-  const { readable, writable } = new TransformStream()
-  const writer = writable.getWriter()
-  const encoder = new TextEncoder()
-
-  const send = (event: string, data: object) => {
-    writer.write(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
-  }
-
-  c.executionCtx.waitUntil((async () => {
-    try {
-      await runAIPipeline({
-        ai: c.env.AI,
-        db: c.env.DB,
-        audioBuffer,
-        history,
-        aiConfig,
-        sessionId,
-        onEvent: send,
-      })
-    } catch (err) {
-      send('error', { message: 'Pipeline failed' })
-    } finally {
-      writer.close()
-    }
-  })())
-
-  return new Response(readable, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive',
-    },
-  })
-})
-
-export { app as turnRoute }
-```
-
-### `src/routes/config.ts`
-
-```typescript
-import { Hono } from 'hono'
-import { getAiConfig, upsertAiConfig, getUserByGuestId } from '../lib/db'
-import type { Env } from '../types'
-
-const app = new Hono<{ Bindings: Env }>()
-
-// GET /api/config?guest_id=xxx
-app.get('/', async (c) => {
-  const guestId = c.req.query('guest_id')
-  if (!guestId) return c.json({ error: 'guest_id required' }, 400)
-  const user = await getUserByGuestId(c.env.DB, guestId)
-  if (!user) return c.json({ error: 'user not found' }, 404)
-  const config = await getAiConfig(c.env.DB, user.id)
-  return c.json(config)
-})
-
-// POST /api/config
-// Body: { guest_id, user_name, custom_instructions }
-app.post('/', async (c) => {
-  const { guest_id, user_name, custom_instructions } = await c.req.json()
-  const user = await getUserByGuestId(c.env.DB, guest_id)
-  if (!user) return c.json({ error: 'user not found' }, 404)
-  const config = await upsertAiConfig(c.env.DB, user.id, {
-    user_name,
-    custom_instructions,
-  })
-  return c.json(config)
-})
-
-export { app as configRoute }
-```
-
 ### `src/routes/history.ts`
 
 ```typescript
 import { Hono } from 'hono'
+import { getCookie } from 'hono/cookie'
 import { loadHistory } from '../lib/db'
 import type { Env } from '../types'
 
 const app = new Hono<{ Bindings: Env }>()
 
-// GET /api/history?session_id=xxx&limit=50
+// GET /api/history
+// Auth: session_id cookie
+// Returns: { messages: [{ role, content }] }
 // Used on app load to hydrate the transcript panel
 app.get('/', async (c) => {
-  const sessionId = c.req.query('session_id')
+  const sessionId = getCookie(c, 'session_id')
+  if (!sessionId) return c.json({ error: 'Unauthorized' }, 401)
+
   const limit = parseInt(c.req.query('limit') ?? '50', 10)
-  if (!sessionId) return c.json({ error: 'session_id required' }, 400)
   const messages = await loadHistory(c.env.DB, sessionId, limit)
+
   return c.json({ messages })
 })
 
 export { app as historyRoute }
 ```
 
-### `src/lib/db.ts` — D1 query helpers
+### `src/routes/config.ts`
 
-> Current implementation note: config helpers now return and persist `user_name` and `custom_instructions`. Legacy `ai_name` and `system_prompt` are retained only so old rows remain readable.
+```typescript
+import { Hono } from 'hono'
+import { getCookie } from 'hono/cookie'
+import { getSessionBySessionId, getAiConfig, upsertAiConfig } from '../lib/db'
+import type { Env } from '../types'
+
+const app = new Hono<{ Bindings: Env }>()
+
+// GET /api/config
+// Returns AI name and system prompt for the current user
+app.get('/', async (c) => {
+  const sessionId = getCookie(c, 'session_id')
+  if (!sessionId) return c.json({ error: 'Unauthorized' }, 401)
+
+  const session = await getSessionBySessionId(c.env.DB, sessionId)
+  if (!session) return c.json({ error: 'Session not found' }, 404)
+
+  const config = await getAiConfig(c.env.DB, session.user_id)
+  return c.json(config)
+})
+
+// POST /api/config
+// Body: { ai_name: string, system_prompt: string }
+app.post('/', async (c) => {
+  const sessionId = getCookie(c, 'session_id')
+  if (!sessionId) return c.json({ error: 'Unauthorized' }, 401)
+
+  const session = await getSessionBySessionId(c.env.DB, sessionId)
+  if (!session) return c.json({ error: 'Session not found' }, 404)
+
+  const { ai_name, system_prompt } = await c.req.json()
+  const config = await upsertAiConfig(c.env.DB, session.user_id, { ai_name, system_prompt })
+
+  return c.json(config)
+})
+
+export { app as configRoute }
+```
+
+### `src/lib/db.ts` — D1 query helpers
 
 ```typescript
 import type { D1Database } from '@cloudflare/workers-types'
+import type { Message, AiConfig, User, Session } from '../types'
+
+// ── Users ──────────────────────────────────────────────────────────────────
 
 export async function upsertUser(
   db: D1Database,
   { guest_id, email }: { guest_id: string; email?: string }
-) {
-  // Try find by guest_id first
-  let user = await db.prepare('SELECT * FROM users WHERE guest_id = ?')
-    .bind(guest_id).first<any>()
+): Promise<User & { is_new: boolean }> {
+  // 1. Try find by guest_id first (most common path)
+  let user = await db
+    .prepare('SELECT * FROM users WHERE guest_id = ?')
+    .bind(guest_id)
+    .first<User>()
 
   if (!user) {
-    // If email provided, check if email user already exists
+    // 2. If email given, check if email user already exists (returning user, new device)
     if (email) {
-      user = await db.prepare('SELECT * FROM users WHERE email = ?')
-        .bind(email).first<any>()
+      user = await db
+        .prepare('SELECT * FROM users WHERE email = ?')
+        .bind(email)
+        .first<User>()
+
       if (user) {
-        // Associate this guest_id with the existing email user
-        await db.prepare('UPDATE users SET guest_id = ? WHERE id = ?')
-          .bind(guest_id, user.id).run()
+        // Associate new guest_id with existing email user
+        await db
+          .prepare('UPDATE users SET guest_id = ? WHERE id = ?')
+          .bind(guest_id, user.id)
+          .run()
         return { ...user, is_new: false }
       }
     }
-    // Create new user
+
+    // 3. Create brand new user
     const id = crypto.randomUUID()
-    await db.prepare('INSERT INTO users (id, email, guest_id) VALUES (?, ?, ?)')
-      .bind(id, email ?? null, guest_id).run()
-    user = await db.prepare('SELECT * FROM users WHERE id = ?').bind(id).first<any>()
-    return { ...user, is_new: true }
+    await db
+      .prepare('INSERT INTO users (id, email, guest_id) VALUES (?, ?, ?)')
+      .bind(id, email ?? null, guest_id)
+      .run()
+    user = await db
+      .prepare('SELECT * FROM users WHERE id = ?')
+      .bind(id)
+      .first<User>()
+
+    return { ...user!, is_new: true }
   }
 
-  // Update email if now provided and not previously set
+  // Update email if now provided and was not set before
   if (email && !user.email) {
-    await db.prepare('UPDATE users SET email = ? WHERE id = ?')
-      .bind(email, user.id).run()
-    user.email = email
+    await db
+      .prepare('UPDATE users SET email = ? WHERE id = ?')
+      .bind(email, user.id)
+      .run()
+    user = { ...user, email }
   }
 
   return { ...user, is_new: false }
 }
 
-export async function getOrCreateSession(db: D1Database, userId: string) {
-  // Single conversation model — always reuse existing session
+// ── Sessions ───────────────────────────────────────────────────────────────
+
+export async function getOrCreateSession(
+  db: D1Database,
+  userId: string
+): Promise<Session> {
+  // Single conversation model — always reuse the existing session
   let session = await db
     .prepare('SELECT * FROM sessions WHERE user_id = ? ORDER BY created_at ASC LIMIT 1')
-    .bind(userId).first<any>()
+    .bind(userId)
+    .first<Session>()
 
   if (!session) {
     const id = crypto.randomUUID()
-    await db.prepare('INSERT INTO sessions (id, user_id) VALUES (?, ?)')
-      .bind(id, userId).run()
-    session = await db.prepare('SELECT * FROM sessions WHERE id = ?')
-      .bind(id).first<any>()
+    await db
+      .prepare('INSERT INTO sessions (id, user_id) VALUES (?, ?)')
+      .bind(id, userId)
+      .run()
+    session = await db
+      .prepare('SELECT * FROM sessions WHERE id = ?')
+      .bind(id)
+      .first<Session>()
   }
 
-  return session
+  return session!
 }
 
-export async function loadHistory(db: D1Database, sessionId: string, limit = 20) {
-  const rows = await db.prepare(
-    `SELECT role, transcript FROM messages
-     WHERE session_id = ?
-     ORDER BY created_at DESC
-     LIMIT ?`
-  ).bind(sessionId, limit).all<any>()
+export async function getSessionBySessionId(
+  db: D1Database,
+  sessionId: string
+): Promise<Session | null> {
+  return db
+    .prepare('SELECT * FROM sessions WHERE id = ?')
+    .bind(sessionId)
+    .first<Session>()
+}
 
-  // Reverse to chronological order, map to LLM message format
-  return (rows.results ?? []).reverse().map(r => ({
-    role: r.role as 'user' | 'assistant',
-    content: r.transcript,
-  }))
+// ── Messages ───────────────────────────────────────────────────────────────
+
+export async function loadHistory(
+  db: D1Database,
+  sessionId: string,
+  limit = 30
+): Promise<Message[]> {
+  const rows = await db
+    .prepare(
+      `SELECT role, content FROM messages
+       WHERE session_id = ?
+       ORDER BY created_at DESC
+       LIMIT ?`
+    )
+    .bind(sessionId, limit)
+    .all<{ role: string; content: string }>()
+
+  // Reverse DESC results to get chronological order
+  return (rows.results ?? [])
+    .reverse()
+    .map(r => ({ role: r.role as 'user' | 'assistant', content: r.content }))
 }
 
 export async function insertMessage(
   db: D1Database,
   sessionId: string,
   role: 'user' | 'assistant',
-  transcript: string
-) {
-  const id = crypto.randomUUID()
-  await db.prepare(
-    'INSERT INTO messages (id, session_id, role, transcript) VALUES (?, ?, ?, ?)'
-  ).bind(id, sessionId, role, transcript).run()
-  return { id, role, transcript }
+  content: string
+): Promise<void> {
+  await db
+    .prepare('INSERT INTO messages (id, session_id, role, content) VALUES (?, ?, ?, ?)')
+    .bind(crypto.randomUUID(), sessionId, role, content)
+    .run()
 }
 
-export async function getUserByGuestId(db: D1Database, guestId: string) {
-  return db.prepare('SELECT * FROM users WHERE guest_id = ?')
-    .bind(guestId).first<any>()
+// ── AI Config ─────────────────────────────────────────────────────────────
+
+const DEFAULT_CONFIG: AiConfig = {
+  ai_name: 'Aria',
+  system_prompt:
+    'You are Aria, a warm and intelligent voice assistant. You speak in a natural, conversational tone — as if talking to a friend. Keep responses concise: 1–3 sentences unless more detail is genuinely needed. Never use markdown, bullet points, headers, or lists. Respond in plain flowing sentences only, since your words will be spoken aloud.',
 }
 
-export async function getAiConfig(db: D1Database, userId: string) {
-  const config = await db.prepare('SELECT * FROM ai_configs WHERE user_id = ?')
-    .bind(userId).first<any>()
-  if (!config) {
-    return {
-      ai_name: 'Assistant',
-      system_prompt:
-        'You are a helpful voice assistant. Keep responses concise and conversational, suitable for being spoken aloud. Avoid markdown, bullet points, or any formatting — respond in plain spoken sentences only.',
-    }
-  }
-  return config
+export async function getAiConfig(
+  db: D1Database,
+  userId: string
+): Promise<AiConfig> {
+  const config = await db
+    .prepare('SELECT ai_name, system_prompt FROM ai_configs WHERE user_id = ?')
+    .bind(userId)
+    .first<AiConfig>()
+
+  return config ?? DEFAULT_CONFIG
 }
 
 export async function upsertAiConfig(
   db: D1Database,
   userId: string,
-  { ai_name, system_prompt }: { ai_name: string; system_prompt: string }
-) {
-  const existing = await db.prepare('SELECT id FROM ai_configs WHERE user_id = ?')
-    .bind(userId).first<any>()
+  { ai_name, system_prompt }: AiConfig
+): Promise<AiConfig> {
+  const existing = await db
+    .prepare('SELECT id FROM ai_configs WHERE user_id = ?')
+    .bind(userId)
+    .first<{ id: string }>()
 
   if (existing) {
-    await db.prepare(
-      `UPDATE ai_configs SET ai_name = ?, system_prompt = ?, updated_at = datetime('now')
-       WHERE user_id = ?`
-    ).bind(ai_name, system_prompt, userId).run()
+    await db
+      .prepare(
+        `UPDATE ai_configs
+         SET ai_name = ?, system_prompt = ?, updated_at = datetime('now')
+         WHERE user_id = ?`
+      )
+      .bind(ai_name, system_prompt, userId)
+      .run()
   } else {
-    const id = crypto.randomUUID()
-    await db.prepare(
-      'INSERT INTO ai_configs (id, user_id, ai_name, system_prompt) VALUES (?, ?, ?, ?)'
-    ).bind(id, userId, ai_name, system_prompt).run()
+    await db
+      .prepare(
+        'INSERT INTO ai_configs (id, user_id, ai_name, system_prompt) VALUES (?, ?, ?, ?)'
+      )
+      .bind(crypto.randomUUID(), userId, ai_name, system_prompt)
+      .run()
   }
 
   return { ai_name, system_prompt }
+}
+```
+
+### `src/durable-objects/VoiceSession.ts` — Core DO
+
+```typescript
+import { DurableObject } from 'cloudflare:workers'
+import { runLLM, runTTS } from '../lib/ai'
+import { loadHistory, insertMessage, getSessionBySessionId, getAiConfig } from '../lib/db'
+import type { Env, Message } from '../types'
+
+// WebSocket message types (client → server)
+type ClientMessage =
+  | { type: 'transcript'; text: string }
+  | { type: 'ping' }
+
+// WebSocket message types (server → client)
+type ServerMessage =
+  | { type: 'status'; state: 'thinking' | 'speaking' | 'idle' | 'error' }
+  | { type: 'llm_chunk'; text: string }
+  | { type: 'audio'; data: string; format: 'mp3' }
+  | { type: 'transcript_confirmed'; text: string }
+  | { type: 'error'; message: string }
+  | { type: 'pong' }
+
+export class VoiceSession extends DurableObject<Env> {
+  // In-memory state for the duration of a WS connection
+  private sessionId: string | null = null
+  private userId: string | null = null
+  private processing = false
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url)
+
+    // Extract session_id from cookie or query param
+    const cookieHeader = request.headers.get('Cookie') ?? ''
+    const cookieMatch = cookieHeader.match(/session_id=([^;]+)/)
+    const sessionId = cookieMatch?.[1] ?? url.searchParams.get('session_id')
+
+    if (!sessionId) {
+      return new Response('Unauthorized', { status: 401 })
+    }
+
+    // Validate session exists in D1
+    const session = await getSessionBySessionId(this.env.DB, sessionId)
+    if (!session) {
+      return new Response('Session not found', { status: 404 })
+    }
+
+    this.sessionId = session.id
+    this.userId = session.user_id
+
+    // WebSocket upgrade using Hibernation API
+    const upgradeHeader = request.headers.get('Upgrade')
+    if (!upgradeHeader || upgradeHeader !== 'websocket') {
+      return new Response('Expected WebSocket', { status: 426 })
+    }
+
+    const pair = new WebSocketPair()
+    const [client, server] = Object.values(pair)
+
+    // acceptWebSocket enables Hibernation — DO sleeps when no messages
+    this.ctx.acceptWebSocket(server)
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    })
+  }
+
+  // Called by Hibernation API when a message arrives
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (typeof message !== 'string') return
+
+    let parsed: ClientMessage
+    try {
+      parsed = JSON.parse(message)
+    } catch {
+      this.send(ws, { type: 'error', message: 'Invalid JSON' })
+      return
+    }
+
+    if (parsed.type === 'ping') {
+      this.send(ws, { type: 'pong' })
+      return
+    }
+
+    if (parsed.type === 'transcript') {
+      await this.handleTurn(ws, parsed.text)
+    }
+  }
+
+  async webSocketClose(ws: WebSocket): Promise<void> {
+    // DO will hibernate automatically — no cleanup needed
+  }
+
+  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
+    console.error('WebSocket error:', error)
+  }
+
+  // ── Core turn handler ────────────────────────────────────────────────────
+
+  private async handleTurn(ws: WebSocket, userText: string): Promise<void> {
+    if (this.processing) {
+      this.send(ws, { type: 'error', message: 'Already processing a turn' })
+      return
+    }
+
+    if (!this.sessionId || !this.userId) {
+      this.send(ws, { type: 'error', message: 'Session not initialized' })
+      return
+    }
+
+    this.processing = true
+
+    try {
+      // 1. Confirm receipt of user transcript
+      this.send(ws, { type: 'transcript_confirmed', text: userText })
+
+      // 2. Save user message to D1
+      await insertMessage(this.env.DB, this.sessionId, 'user', userText)
+
+      // 3. Load conversation history + AI config
+      const [history, aiConfig] = await Promise.all([
+        loadHistory(this.env.DB, this.sessionId, 30),
+        getAiConfig(this.env.DB, this.userId),
+      ])
+
+      // 4. Run LLM
+      this.send(ws, { type: 'status', state: 'thinking' })
+
+      const llmResponse = await runLLM({
+        ai: this.env.AI,
+        history,
+        userText,
+        systemPrompt: aiConfig.system_prompt,
+        onChunk: (chunk) => {
+          this.send(ws, { type: 'llm_chunk', text: chunk })
+        },
+      })
+
+      // 5. Save AI response to D1
+      await insertMessage(this.env.DB, this.sessionId, 'assistant', llmResponse)
+
+      // 6. Run TTS
+      this.send(ws, { type: 'status', state: 'speaking' })
+
+      const audioBase64 = await runTTS({
+        ai: this.env.AI,
+        text: llmResponse,
+      })
+
+      this.send(ws, { type: 'audio', data: audioBase64, format: 'mp3' })
+
+      // 7. Done — signal client to resume listening
+      this.send(ws, { type: 'status', state: 'idle' })
+
+    } catch (err) {
+      console.error('Turn error:', err)
+      this.send(ws, { type: 'error', message: 'Turn processing failed' })
+      this.send(ws, { type: 'status', state: 'idle' })
+    } finally {
+      this.processing = false
+    }
+  }
+
+  // ── Utility ──────────────────────────────────────────────────────────────
+
+  private send(ws: WebSocket, message: ServerMessage): void {
+    try {
+      ws.send(JSON.stringify(message))
+    } catch {
+      // WebSocket may have closed — ignore
+    }
+  }
 }
 ```
 
@@ -604,362 +875,561 @@ export async function upsertAiConfig(
 ### `src/lib/ai.ts`
 
 ```typescript
-import type { Ai, D1Database } from '@cloudflare/workers-types'
-import { insertMessage } from './db'
+import type { Ai } from '@cloudflare/workers-types'
 
-type Message = { role: 'user' | 'assistant'; content: string }
-type AiConfig = { user_name?: string; custom_instructions?: string }
-type SSEEvent = (event: string, data: object) => void
+// ── LLM — Llama 3.1 8B ──────────────────────────────────────────────────────
 
-interface PipelineOptions {
+interface LLMOptions {
   ai: Ai
-  db: D1Database
-  audioBuffer: ArrayBuffer
-  history: Message[]
-  aiConfig: AiConfig
-  sessionId: string
-  onEvent: SSEEvent
+  history: Array<{ role: 'user' | 'assistant'; content: string }>
+  userText: string
+  systemPrompt: string
+  onChunk?: (text: string) => void
 }
 
-export async function runAIPipeline({
-  ai, db, audioBuffer, history, aiConfig, sessionId, onEvent,
-}: PipelineOptions) {
-
-  // ── Step 1: STT — Whisper ────────────────────────────────────────────────
-  onEvent('status', { state: 'transcribing' })
-
-  const sttResult = await ai.run('@cf/openai/whisper', {
-    audio: [...new Uint8Array(audioBuffer)],
-  }) as { text: string }
-
-  const userTranscript = sttResult.text?.trim()
-  if (!userTranscript) {
-    onEvent('error', { message: 'Could not transcribe audio' })
-    return
-  }
-
-  onEvent('transcript_user', { text: userTranscript })
-  await insertMessage(db, sessionId, 'user', userTranscript)
-
-  // ── Step 2: LLM — Llama 3.1 8B ──────────────────────────────────────────
-  onEvent('status', { state: 'thinking' })
-
-  const messages: Message[] = [
+export async function runLLM({
+  ai, history, userText, systemPrompt, onChunk,
+}: LLMOptions): Promise<string> {
+  const messages = [
     ...history,
-    { role: 'user', content: userTranscript },
+    { role: 'user' as const, content: userText },
   ]
 
-  const llmResult = await ai.run('@cf/meta/llama-3.1-8b-instruct', {
+  // System prompt instructs model to be concise and conversational
+  // Voice-optimized: no markdown, short sentences, spoken-word style
+  const result = await ai.run('@cf/meta/llama-3.1-8b-instruct', {
     messages: [
-      { role: 'system', content: buildSystemPrompt(aiConfig) },
+      {
+        role: 'system',
+        content: systemPrompt,
+      },
       ...messages,
     ],
-    max_tokens: 300,
-    temperature: 0.7,
+    max_tokens: 300,       // Keep responses short for TTS — long responses feel slow
+    temperature: 0.75,     // Slightly creative but not erratic
+    stream: false,         // Cloudflare Workers AI does not support true streaming LLM yet in DO context
   }) as { response: string }
 
-  const aiResponseText = llmResult.response?.trim()
-  if (!aiResponseText) {
-    onEvent('error', { message: 'LLM returned empty response' })
-    return
+  const text = result.response?.trim() ?? ''
+
+  // Emit chunks for UI streaming (word-by-word simulation since CF LLM is non-streaming in DO)
+  if (onChunk && text) {
+    const words = text.split(' ')
+    for (const word of words) {
+      onChunk(word + ' ')
+      // Small yield to allow WS message to flush (non-blocking)
+      await new Promise(r => setTimeout(r, 0))
+    }
   }
 
-  await insertMessage(db, sessionId, 'assistant', aiResponseText)
-
-  // ── Step 3: TTS — MeloTTS ───────────────────────────────────────────────
-  onEvent('status', { state: 'speaking' })
-  onEvent('transcript_ai', { text: aiResponseText })
-
-  const ttsResult = await ai.run('@cf/myshell-ai/melotts', {
-    prompt: aiResponseText,
-  }) as { audio: string } // base64-encoded WAV
-
-  onEvent('audio', { data: ttsResult.audio, format: 'wav' })
-
-  // ── Done ─────────────────────────────────────────────────────────────────
-  onEvent('status', { state: 'done' })
+  return text
 }
 
-function buildSystemPrompt(aiConfig: AiConfig): string {
-  const parts = [
-    'You are a helpful voice assistant. Keep responses concise and conversational, suitable for being spoken aloud. Avoid markdown, bullet points, lists, code fences, or visual formatting. Respond in plain spoken sentences only.',
-  ]
-  if (aiConfig.user_name) {
-    parts.push(`The user's preferred name is ${aiConfig.user_name}. Address them naturally by this name when appropriate.`)
-  }
-  if (aiConfig.custom_instructions) {
-    parts.push(`Additional user instructions: ${aiConfig.custom_instructions}`)
-  }
-  return parts.join('\n\n')
+// ── TTS — Deepgram Aura-1 ────────────────────────────────────────────────────
+
+interface TTSOptions {
+  ai: Ai
+  text: string
+}
+
+export async function runTTS({ ai, text }: TTSOptions): Promise<string> {
+  // System prompt for Deepgram Aura-1: natural, warm speaking style
+  // Aura-1 supports voice selection and speaking style hints
+  const result = await ai.run('@cf/deepgram/aura-1', {
+    text,
+    // Voice options: "aura-asteria-en" (female, warm), "aura-orion-en" (male, confident)
+    // "aura-luna-en" (female, soft), "aura-zeus-en" (male, deep)
+    voice: 'aura-asteria-en',
+  }) as { audio: string } // base64-encoded MP3
+
+  return result.audio
 }
 ```
 
-### SSE event contract
+### System prompts
 
-| Event | Payload | Description |
-|---|---|---|
-| `status` | `{ state: "transcribing" \| "thinking" \| "speaking" \| "done" }` | Current pipeline phase |
-| `transcript_user` | `{ text: string }` | User's spoken words after STT |
-| `transcript_ai` | `{ text: string }` | AI's response text |
-| `audio` | `{ data: string (base64), format: "wav" }` | TTS audio to play |
-| `error` | `{ message: string }` | Pipeline error |
+**LLM system prompt (stored in D1 `ai_configs`, user-editable via settings)**:
+```
+You are Aria, a warm and intelligent voice assistant. You speak in a natural,
+conversational tone — as if talking to a friend. Keep responses concise: 1–3
+sentences unless more detail is genuinely needed. Never use markdown, bullet
+points, headers, or lists. Respond in plain flowing sentences only, since your
+words will be spoken aloud.
+```
+
+**TTS voice**: `aura-asteria-en` — warm, natural female voice from Deepgram. Can be changed to any Aura voice variant.
 
 ---
 
-## 7. Frontend — React SPA
+## 7. WebSocket Message Protocol
 
-### Conversation state machine
+### Connection
 
 ```
-idle → listening   (VAD started)
-     → transcribing (audio sent, SSE: status=transcribing)
-     → thinking     (SSE: status=thinking)
-     → speaking     (SSE: status=speaking)
-     → listening    (SSE: status=done — auto-resumes)
-     → idle         (user clicks End)
+Client: GET /ws (with Cookie: session_id=SESSION_ID or ?session_id=SESSION_ID)
+        Upgrade: websocket
+
+Server: 101 Switching Protocols
+        → Connection handed to VoiceSession Durable Object
 ```
 
-### Waveform color map
-
-| State | Canvas behavior | Color |
-|---|---|---|
-| `idle` | Flat line | Gray `#6b7280` |
-| `listening` | Live mic AnalyserNode data | Indigo `#6366f1` |
-| `transcribing` | Slow breathing sine | Gray `#9ca3af` |
-| `thinking` | Slow breathing sine | Gray `#9ca3af` |
-| `speaking` | Live TTS audio AnalyserNode data | Emerald `#10b981` |
-
-### `client/src/hooks/useVAD.ts`
+### Client → Server messages
 
 ```typescript
-import { useMicVAD } from '@ricky0123/vad-react'
+// User spoke — Web Speech API finalTranscript fired
+{ type: "transcript", text: "What is the weather like today?" }
 
-export function useVAD(onSpeechEnd: (audio: Float32Array) => void) {
-  const vad = useMicVAD({
-    startOnLoad: false,
-    onSpeechEnd,
-    // These static files must be present in client/public/
-    modelURL: '/silero_vad.onnx',
-    workletURL: '/vad.worklet.bundle.js',
-    positiveSpeechThreshold: 0.8,
-    negativeSpeechThreshold: 0.3,
-    redemptionFrames: 8,    // ~800ms silence before onSpeechEnd fires
-    preSpeechPadFrames: 10,
-  })
-
-  return {
-    start: vad.start,
-    pause: vad.pause,
-    listening: vad.listening,
-    userSpeaking: vad.userSpeaking,
-  }
-}
+// Keepalive
+{ type: "ping" }
 ```
 
-### `client/src/hooks/useWaveform.ts`
+### Server → Client messages
 
 ```typescript
-import { useEffect, useRef } from 'react'
+// Confirm user transcript received (before LLM starts)
+{ type: "transcript_confirmed", text: "What is the weather like today?" }
 
-type WaveformState = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'
+// Pipeline status updates
+{ type: "status", state: "thinking" }   // LLM is processing
+{ type: "status", state: "speaking" }   // TTS audio incoming
+{ type: "status", state: "idle" }       // Turn complete, mic can resume
 
-const STATE_COLORS: Record<WaveformState, string> = {
-  idle: '#6b7280',
-  listening: '#6366f1',    // indigo — user speaking
-  transcribing: '#9ca3af',
-  thinking: '#9ca3af',
-  speaking: '#10b981',     // emerald — AI speaking
-}
+// LLM response streaming (word by word)
+{ type: "llm_chunk", text: "The weather " }
+{ type: "llm_chunk", text: "today is " }
+{ type: "llm_chunk", text: "sunny and warm." }
 
-export function useWaveform(
-  canvasRef: React.RefObject<HTMLCanvasElement>,
-  analyserRef: React.RefObject<AnalyserNode | null>,
-  state: WaveformState
-) {
-  const animFrameRef = useRef<number>()
+// TTS audio — base64-encoded MP3
+{ type: "audio", data: "SUQzBAAAAAAAI...", format: "mp3" }
 
-  useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-    const ctx = canvas.getContext('2d')!
-    const color = STATE_COLORS[state]
-    const isLive = state === 'listening' || state === 'speaking'
-    const isBreathing = state === 'transcribing' || state === 'thinking'
-    let phase = 0
+// Error
+{ type: "error", message: "Turn processing failed" }
 
-    const draw = () => {
-      animFrameRef.current = requestAnimationFrame(draw)
-      const W = canvas.width
-      const H = canvas.height
-      ctx.clearRect(0, 0, W, H)
-      ctx.beginPath()
-      ctx.strokeStyle = color
-      ctx.lineWidth = 2.5
-      ctx.lineCap = 'round'
-
-      if (isLive && analyserRef.current) {
-        const bufferLength = analyserRef.current.frequencyBinCount
-        const dataArray = new Float32Array(bufferLength)
-        analyserRef.current.getFloatTimeDomainData(dataArray)
-        const sliceWidth = W / bufferLength
-        let x = 0
-        for (let i = 0; i < bufferLength; i++) {
-          const y = (dataArray[i] * H * 2) + H / 2
-          i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
-          x += sliceWidth
-        }
-        phase += 0.05
-      } else if (isBreathing) {
-        phase += 0.02
-        for (let x = 0; x <= W; x += 2) {
-          const y = H / 2 + Math.sin((x / W) * Math.PI * 4 + phase) * 8
-          x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y)
-        }
-      } else {
-        ctx.moveTo(0, H / 2)
-        ctx.lineTo(W, H / 2)
-      }
-
-      ctx.stroke()
-    }
-
-    draw()
-    return () => { if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current) }
-  }, [state, canvasRef, analyserRef])
-}
+// Keepalive response
+{ type: "pong" }
 ```
 
-### `client/src/hooks/useSession.ts`
+### Frontend state machine driven by WS messages
+
+```
+idle
+  │ → user clicks "Start Conversation"
+  ▼
+listening    (mic on, Web Speech API active)
+  │ → finalTranscript fires, send { type: "transcript" }
+  ▼
+transcribing (WS message sent, awaiting server ack)
+  │ → { type: "transcript_confirmed" } received
+  │ → { type: "status", state: "thinking" } received
+  ▼
+thinking     (Persona shows "thinking" animation)
+  │ → { type: "llm_chunk" } messages stream in → transcript panel updates
+  │ → { type: "status", state: "speaking" } received
+  ▼
+speaking     (Persona shows "speaking" animation)
+  │ → { type: "audio" } received → audio plays
+  │ → { type: "status", state: "idle" } received
+  ▼
+listening    (mic resumes automatically — loop)
+  │ → user clicks "End"
+  ▼
+idle
+```
+
+---
+
+## 8. Frontend — React SPA
+
+### `client/src/store/voiceStore.ts` — Zustand global state
 
 ```typescript
-import { useState } from 'react'
+import { create } from 'zustand'
 
-const GUEST_ID_KEY = 'voice_ai_guest_id'
+export type ConvState =
+  | 'idle'
+  | 'listening'
+  | 'transcribing'
+  | 'thinking'
+  | 'speaking'
 
-export function useSession() {
-  const [sessionId, setSessionId] = useState<string | null>(null)
-  const [userId, setUserId] = useState<string | null>(null)
-  const [ready, setReady] = useState(false)
+export type TranscriptMessage = {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+  isStreaming?: boolean  // true while llm_chunk messages are still arriving
+}
 
-  const getGuestId = (): string => {
-    let id = localStorage.getItem(GUEST_ID_KEY)
-    if (!id) {
-      id = crypto.randomUUID()
-      localStorage.setItem(GUEST_ID_KEY, id)
-    }
+type VoiceStore = {
+  // Session
+  sessionId: string | null
+  userId: string | null
+  guestId: string
+  setSession: (sessionId: string, userId: string) => void
+
+  // Conversation state
+  convState: ConvState
+  setConvState: (state: ConvState) => void
+
+  // Messages
+  messages: TranscriptMessage[]
+  addMessage: (msg: TranscriptMessage) => void
+  appendChunkToLast: (text: string) => void
+  setMessages: (msgs: TranscriptMessage[]) => void
+
+  // UI
+  showTranscript: boolean
+  toggleTranscript: () => void
+  conversationStarted: boolean
+  setConversationStarted: (v: boolean) => void
+
+  // AI config
+  aiName: string
+  systemPrompt: string
+  setAiConfig: (name: string, prompt: string) => void
+
+  // Interim transcript (live typing effect from Web Speech API)
+  interimText: string
+  setInterimText: (text: string) => void
+}
+
+export const useVoiceStore = create<VoiceStore>((set) => ({
+  sessionId: null,
+  userId: null,
+  guestId: localStorage.getItem('voice_ai_guest_id') ?? (() => {
+    const id = crypto.randomUUID()
+    localStorage.setItem('voice_ai_guest_id', id)
     return id
-  }
+  })(),
+  setSession: (sessionId, userId) => set({ sessionId, userId }),
+
+  convState: 'idle',
+  setConvState: (convState) => set({ convState }),
+
+  messages: [],
+  addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
+  appendChunkToLast: (text) => set((s) => {
+    const msgs = [...s.messages]
+    const last = msgs[msgs.length - 1]
+    if (last && last.role === 'assistant') {
+      msgs[msgs.length - 1] = { ...last, text: last.text + text }
+    }
+    return { messages: msgs }
+  }),
+  setMessages: (messages) => set({ messages }),
+
+  showTranscript: false,
+  toggleTranscript: () => set((s) => ({ showTranscript: !s.showTranscript })),
+  conversationStarted: false,
+  setConversationStarted: (conversationStarted) => set({ conversationStarted }),
+
+  aiName: 'Aria',
+  systemPrompt: '',
+  setAiConfig: (aiName, systemPrompt) => set({ aiName, systemPrompt }),
+
+  interimText: '',
+  setInterimText: (interimText) => set({ interimText }),
+}))
+```
+
+### `client/src/hooks/useVoiceSession.ts`
+
+```typescript
+import { useEffect } from 'react'
+import { useVoiceStore } from '../store/voiceStore'
+
+export function useVoiceSession() {
+  const { guestId, setSession, setAiConfig } = useVoiceStore()
 
   const initSession = async (email?: string) => {
-    const guestId = getGuestId()
     const res = await fetch('/api/session', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',  // send/receive cookies
       body: JSON.stringify({ guest_id: guestId, email }),
     })
-    const result = await res.json()
-    setSessionId(result.session_id)
-    setUserId(result.user_id)
-    setReady(true)
-    return result
+
+    if (!res.ok) throw new Error('Session init failed')
+
+    const { session_id, user_id } = await res.json()
+    setSession(session_id, user_id)
+
+    // Load AI config
+    const cfgRes = await fetch('/api/config', { credentials: 'include' })
+    if (cfgRes.ok) {
+      const { ai_name, system_prompt } = await cfgRes.json()
+      setAiConfig(ai_name, system_prompt)
+    }
+
+    // Load conversation history
+    const histRes = await fetch('/api/history?limit=50', { credentials: 'include' })
+    if (histRes.ok) {
+      const { messages } = await histRes.json()
+      useVoiceStore.getState().setMessages(
+        messages.map((m: any) => ({
+          id: crypto.randomUUID(),
+          role: m.role,
+          text: m.content,
+        }))
+      )
+    }
+
+    return { session_id, user_id }
   }
 
-  return { sessionId, userId, ready, initSession, getGuestId }
+  return { initSession, guestId }
 }
 ```
 
-### `client/src/hooks/useSSE.ts`
+### `client/src/hooks/useVoiceWebSocket.ts`
 
 ```typescript
-import { useCallback } from 'react'
+import { useEffect, useRef, useCallback } from 'react'
+import { useVoiceStore } from '../store/voiceStore'
 
-type SSEHandlers = {
-  onStatus: (state: string) => void
-  onTranscriptUser: (text: string) => void
-  onTranscriptAI: (text: string) => void
-  onAudio: (base64: string, format: string) => void
-  onError: (message: string) => void
-  onDone: () => void
-}
+export function useVoiceWebSocket() {
+  const wsRef = useRef<WebSocket | null>(null)
+  const { sessionId, setConvState, addMessage, appendChunkToLast } = useVoiceStore()
+  const isConnectedRef = useRef(false)
 
-export function useSSE() {
-  const sendTurn = useCallback(async (
-    audioBlob: Blob,
-    sessionId: string,
-    guestId: string,
-    handlers: SSEHandlers
-  ) => {
-    const formData = new FormData()
-    formData.append('audio', audioBlob, 'audio.wav')
-    formData.append('session_id', sessionId)
-    formData.append('guest_id', guestId)
+  const connect = useCallback(() => {
+    if (!sessionId || isConnectedRef.current) return
 
-    const response = await fetch('/api/turn', { method: 'POST', body: formData })
-    if (!response.body) throw new Error('No response body')
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const host = window.location.host
+    const ws = new WebSocket(`${protocol}//${host}/ws?session_id=${sessionId}`)
 
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) { handlers.onDone(); break }
-
-      buffer += decoder.decode(value, { stream: true })
-      const parts = buffer.split('\n\n')
-      buffer = parts.pop() ?? ''
-
-      for (const part of parts) {
-        let event = 'message'
-        let data = ''
-        for (const line of part.split('\n')) {
-          if (line.startsWith('event: ')) event = line.slice(7)
-          if (line.startsWith('data: ')) data = line.slice(6)
+    ws.onopen = () => {
+      isConnectedRef.current = true
+      // Keepalive ping every 30s to prevent idle disconnection
+      const pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'ping' }))
+        } else {
+          clearInterval(pingInterval)
         }
-        if (!data) continue
-        const parsed = JSON.parse(data)
-        switch (event) {
-          case 'status':           handlers.onStatus(parsed.state); break
-          case 'transcript_user':  handlers.onTranscriptUser(parsed.text); break
-          case 'transcript_ai':    handlers.onTranscriptAI(parsed.text); break
-          case 'audio':            handlers.onAudio(parsed.data, parsed.format); break
-          case 'error':            handlers.onError(parsed.message); break
-        }
+      }, 30_000)
+    }
+
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data)
+
+      switch (msg.type) {
+        case 'transcript_confirmed':
+          // Add user message to transcript panel
+          addMessage({
+            id: crypto.randomUUID(),
+            role: 'user',
+            text: msg.text,
+          })
+          break
+
+        case 'status':
+          setConvState(msg.state)
+          if (msg.state === 'thinking') {
+            // Add empty assistant message — chunks will fill it in
+            addMessage({
+              id: crypto.randomUUID(),
+              role: 'assistant',
+              text: '',
+              isStreaming: true,
+            })
+          }
+          if (msg.state === 'idle') {
+            // Mark last assistant message as no longer streaming
+            const msgs = useVoiceStore.getState().messages
+            const last = msgs[msgs.length - 1]
+            if (last?.isStreaming) {
+              useVoiceStore.getState().setMessages(
+                msgs.map((m, i) => i === msgs.length - 1 ? { ...m, isStreaming: false } : m)
+              )
+            }
+          }
+          break
+
+        case 'llm_chunk':
+          appendChunkToLast(msg.text)
+          break
+
+        case 'audio':
+          // Handled by useAudioPlayer — dispatch custom event
+          window.dispatchEvent(new CustomEvent('voice-ai-audio', {
+            detail: { data: msg.data, format: msg.format }
+          }))
+          break
+
+        case 'error':
+          console.error('Server error:', msg.message)
+          setConvState('idle')
+          break
       }
+    }
+
+    ws.onclose = () => {
+      isConnectedRef.current = false
+      // Reconnect after 2s if session still active
+      setTimeout(() => {
+        if (useVoiceStore.getState().sessionId) connect()
+      }, 2000)
+    }
+
+    ws.onerror = (err) => {
+      console.error('WebSocket error:', err)
+    }
+
+    wsRef.current = ws
+  }, [sessionId])
+
+  const sendTranscript = useCallback((text: string) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'transcript', text }))
+      setConvState('transcribing')
     }
   }, [])
 
-  return { sendTurn }
+  const disconnect = useCallback(() => {
+    wsRef.current?.close()
+    isConnectedRef.current = false
+  }, [])
+
+  useEffect(() => {
+    if (sessionId) connect()
+    return () => disconnect()
+  }, [sessionId])
+
+  return { sendTranscript, connect, disconnect }
 }
 ```
 
-### `client/src/components/WaveformCanvas.tsx`
+### `client/src/hooks/useSpeechRecognition.ts`
 
-```tsx
-import { useRef, useEffect } from 'react'
-import { useWaveform } from '../hooks/useWaveform'
+```typescript
+import { useEffect, useRef, useCallback } from 'react'
+import SpeechRecognition, { useSpeechRecognition as useRSR } from 'react-speech-recognition'
+import { useVoiceStore } from '../store/voiceStore'
 
-type WaveformState = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'
-
-interface Props {
-  state: WaveformState
-  analyserNode: AnalyserNode | null
+interface Options {
+  onFinalTranscript: (text: string) => void
+  enabled: boolean  // false while AI is speaking — prevents feedback loop
 }
 
-export function WaveformCanvas({ state, analyserNode }: Props) {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const analyserRef = useRef<AnalyserNode | null>(analyserNode)
-  useEffect(() => { analyserRef.current = analyserNode }, [analyserNode])
-  useWaveform(canvasRef, analyserRef, state)
+export function useSpeechInput({ onFinalTranscript, enabled }: Options) {
+  const { setInterimText, setConvState } = useVoiceStore()
 
-  return (
-    <canvas
-      ref={canvasRef}
-      width={640}
-      height={160}
-      className="w-full h-40 rounded-2xl bg-black/5 dark:bg-white/5"
-    />
-  )
+  const {
+    transcript,
+    interimTranscript,
+    finalTranscript,
+    listening,
+    browserSupportsSpeechRecognition,
+    resetTranscript,
+  } = useRSR()
+
+  // Fire when finalTranscript updates (user paused naturally)
+  useEffect(() => {
+    if (finalTranscript && enabled) {
+      const text = finalTranscript.trim()
+      if (text.length > 0) {
+        resetTranscript()
+        setInterimText('')
+        onFinalTranscript(text)
+      }
+    }
+  }, [finalTranscript])
+
+  // Stream interim transcript to UI
+  useEffect(() => {
+    setInterimText(interimTranscript)
+  }, [interimTranscript])
+
+  const startListening = useCallback(() => {
+    if (!browserSupportsSpeechRecognition) {
+      alert('Your browser does not support speech recognition. Please use Chrome or Edge.')
+      return
+    }
+    SpeechRecognition.startListening({
+      continuous: true,      // keep listening between phrases
+      language: 'en-US',
+      interimResults: true,  // stream interim transcript to UI
+    })
+    setConvState('listening')
+  }, [browserSupportsSpeechRecognition])
+
+  const stopListening = useCallback(() => {
+    SpeechRecognition.stopListening()
+    resetTranscript()
+    setInterimText('')
+  }, [])
+
+  return {
+    startListening,
+    stopListening,
+    listening,
+    isSupported: browserSupportsSpeechRecognition,
+    interimTranscript,
+  }
+}
+```
+
+### `client/src/hooks/useAudioPlayer.ts`
+
+```typescript
+import { useEffect, useRef, useCallback } from 'react'
+import { useVoiceStore } from '../store/voiceStore'
+
+interface Options {
+  onPlaybackEnd: () => void  // called when TTS audio finishes → resume mic
+}
+
+export function useAudioPlayer({ onPlaybackEnd }: Options) {
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+
+  useEffect(() => {
+    const handleAudio = (event: Event) => {
+      const { data, format } = (event as CustomEvent).detail
+
+      // Decode base64 → Blob → Object URL
+      const binary = atob(data)
+      const bytes = new Uint8Array(binary.length)
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i)
+      }
+      const blob = new Blob([bytes], { type: `audio/${format}` })
+      const url = URL.createObjectURL(blob)
+
+      // Play
+      if (audioRef.current) {
+        audioRef.current.pause()
+        URL.revokeObjectURL(audioRef.current.src)
+      }
+
+      const audio = new Audio(url)
+      audioRef.current = audio
+
+      audio.onended = () => {
+        URL.revokeObjectURL(url)
+        onPlaybackEnd()
+      }
+
+      audio.onerror = () => {
+        URL.revokeObjectURL(url)
+        onPlaybackEnd()
+      }
+
+      audio.play().catch(console.error)
+    }
+
+    window.addEventListener('voice-ai-audio', handleAudio)
+    return () => window.removeEventListener('voice-ai-audio', handleAudio)
+  }, [onPlaybackEnd])
+
+  const stopAudio = useCallback(() => {
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current = null
+    }
+  }, [])
+
+  return { stopAudio }
 }
 ```
 
@@ -967,61 +1437,91 @@ export function WaveformCanvas({ state, analyserNode }: Props) {
 
 ```tsx
 import { useState } from 'react'
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription
+} from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 
 interface Props {
   open: boolean
-  onContinue: (email?: string) => void
+  onContinue: (email?: string) => Promise<void>
 }
 
 export function LandingPopup({ open, onContinue }: Props) {
-  const [email, setEmail] = useState('')
   const [mode, setMode] = useState<'choice' | 'email'>('choice')
+  const [email, setEmail] = useState('')
+  const [loading, setLoading] = useState(false)
+
+  const handleContinue = async (emailValue?: string) => {
+    setLoading(true)
+    try {
+      await onContinue(emailValue)
+    } finally {
+      setLoading(false)
+    }
+  }
 
   return (
     <Dialog open={open}>
-      <DialogContent className="sm:max-w-sm" hideClose>
+      <DialogContent className="sm:max-w-sm" onInteractOutside={(e) => e.preventDefault()}>
         <DialogHeader>
-          <DialogTitle className="text-center text-xl">Welcome</DialogTitle>
+          <DialogTitle className="text-center text-2xl font-semibold">
+            Welcome
+          </DialogTitle>
+          <DialogDescription className="text-center text-sm text-muted-foreground">
+            Start a voice conversation with your AI assistant
+          </DialogDescription>
         </DialogHeader>
 
         {mode === 'choice' && (
           <div className="flex flex-col gap-3 pt-2">
-            <button
+            <Button
               onClick={() => setMode('email')}
-              className="w-full py-3 rounded-xl bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition"
+              className="w-full"
+              size="lg"
             >
-              Sign in with email
-            </button>
-            <button
-              onClick={() => onContinue(undefined)}
-              className="w-full py-3 rounded-xl border border-gray-200 dark:border-gray-700 text-sm text-gray-500 hover:bg-gray-50 dark:hover:bg-gray-800 transition"
+              Continue with email
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => handleContinue(undefined)}
+              disabled={loading}
+              className="w-full"
+              size="lg"
             >
-              Continue as guest
-            </button>
+              {loading ? 'Starting...' : 'Continue as guest'}
+            </Button>
           </div>
         )}
 
         {mode === 'email' && (
           <div className="flex flex-col gap-3 pt-2">
-            <input
+            <Input
               type="email"
               placeholder="you@example.com"
               value={email}
-              onChange={e => setEmail(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && email && onContinue(email)}
-              className="w-full px-4 py-3 rounded-xl border border-gray-200 dark:border-gray-700 bg-transparent focus:outline-none focus:ring-2 focus:ring-indigo-500 text-sm"
+              onChange={(e) => setEmail(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && email) handleContinue(email)
+              }}
+              autoFocus
             />
-            <button
-              onClick={() => email && onContinue(email)}
-              disabled={!email}
-              className="w-full py-3 rounded-xl bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition disabled:opacity-40"
+            <Button
+              onClick={() => handleContinue(email)}
+              disabled={!email || loading}
+              className="w-full"
+              size="lg"
             >
-              Continue
-            </button>
-            <button onClick={() => setMode('choice')} className="text-sm text-gray-500 hover:text-gray-700 transition">
+              {loading ? 'Starting...' : 'Start conversation'}
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => setMode('choice')}
+              className="w-full text-sm"
+            >
               ← Back
-            </button>
+            </Button>
           </div>
         )}
       </DialogContent>
@@ -1030,56 +1530,57 @@ export function LandingPopup({ open, onContinue }: Props) {
 }
 ```
 
-### `client/src/components/Controls.tsx`
+### `client/src/components/PersonaView.tsx`
 
 ```tsx
-import { Mic, Square } from 'lucide-react'
+import { Persona } from '@/components/ai-elements/persona'
+import { useVoiceStore, type ConvState } from '../store/voiceStore'
 
-type ConvState = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'
-
-interface Props {
-  state: ConvState
-  onStart: () => void
-  onStop: () => void
+// Map our conversation states to AI Elements Persona states
+const PERSONA_STATE_MAP: Record<ConvState, 'idle' | 'listening' | 'thinking' | 'speaking' | 'asleep'> = {
+  idle: 'asleep',
+  listening: 'listening',
+  transcribing: 'listening',
+  thinking: 'thinking',
+  speaking: 'speaking',
 }
 
-export function Controls({ state, onStart, onStop }: Props) {
-  const isActive = state !== 'idle'
-  const isProcessing = ['transcribing', 'thinking', 'speaking'].includes(state)
+const STATUS_LABELS: Record<ConvState, string> = {
+  idle: '',
+  listening: 'Listening...',
+  transcribing: 'Got it...',
+  thinking: 'Thinking...',
+  speaking: 'Speaking...',
+}
 
-  const statusLabel: Record<ConvState, string> = {
-    idle: '',
-    listening: 'Listening',
-    transcribing: 'Transcribing...',
-    thinking: 'Thinking...',
-    speaking: 'Speaking...',
-  }
+interface Props {
+  aiName: string
+}
+
+export function PersonaView({ aiName }: Props) {
+  const { convState, interimText } = useVoiceStore()
+  const personaState = PERSONA_STATE_MAP[convState]
+  const statusLabel = STATUS_LABELS[convState]
 
   return (
-    <div className="flex items-center justify-center gap-4">
-      {!isActive ? (
-        <button
-          onClick={onStart}
-          className="flex items-center gap-2 px-6 py-3 rounded-full bg-indigo-600 text-white font-medium hover:bg-indigo-700 transition shadow-lg"
-        >
-          <Mic size={18} />
-          Start talking
-        </button>
-      ) : (
-        <>
-          <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-gray-100 dark:bg-gray-800 text-sm text-gray-500">
-            <span className={`w-2 h-2 rounded-full ${isProcessing ? 'bg-emerald-400' : 'bg-indigo-400'} animate-pulse`} />
-            {statusLabel[state]}
-          </div>
-          <button
-            onClick={onStop}
-            className="flex items-center gap-2 px-4 py-3 rounded-full bg-red-100 dark:bg-red-900/30 text-red-600 hover:bg-red-200 transition"
-          >
-            <Square size={16} fill="currentColor" />
-            End
-          </button>
-        </>
-      )}
+    <div className="flex flex-col items-center gap-6">
+      <Persona
+        state={personaState}
+        variant="obsidian"
+        className="w-48 h-48"
+      />
+
+      <div className="text-center min-h-[2rem]">
+        {convState === 'listening' && interimText ? (
+          <p className="text-sm text-muted-foreground italic max-w-xs text-center">
+            "{interimText}"
+          </p>
+        ) : statusLabel ? (
+          <p className="text-sm text-muted-foreground">{statusLabel}</p>
+        ) : (
+          <p className="text-sm font-medium text-foreground">{aiName}</p>
+        )}
+      </div>
     </div>
   )
 }
@@ -1089,428 +1590,475 @@ export function Controls({ state, onStart, onStop }: Props) {
 
 ```tsx
 import { useEffect, useRef } from 'react'
-
-export type TranscriptMessage = {
-  id: string
-  role: 'user' | 'assistant'
-  text: string
-}
+import {
+  Conversation,
+  ConversationContent,
+} from '@/components/ai-elements/conversation'
+import {
+  Message,
+  MessageContent,
+  MessageResponse,
+} from '@/components/ai-elements/message'
+import { Shimmer } from '@/components/ai-elements/shimmer'
+import { useVoiceStore } from '../store/voiceStore'
 
 interface Props {
-  messages: TranscriptMessage[]
-  assistantName: string
+  aiName: string
 }
 
-export function TranscriptPanel({ messages, assistantName }: Props) {
+export function TranscriptPanel({ aiName }: Props) {
+  const { messages } = useVoiceStore()
   const bottomRef = useRef<HTMLDivElement>(null)
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
 
   return (
-    <div className="flex flex-col gap-3 overflow-y-auto h-full p-4">
-      {messages.map(msg => (
-        <div key={msg.id} className={`flex flex-col gap-1 ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
-          <span className="text-xs text-gray-400 px-1">
-            {msg.role === 'user' ? 'You' : assistantName}
-          </span>
-          <div className={`px-4 py-2.5 rounded-2xl max-w-[85%] text-sm leading-relaxed ${
-            msg.role === 'user'
-              ? 'bg-indigo-600 text-white rounded-br-sm'
-              : 'bg-gray-100 dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded-bl-sm'
-          }`}>
-            {msg.text}
-          </div>
-        </div>
-      ))}
-      <div ref={bottomRef} />
-    </div>
-  )
-}
-```
+    <div className="flex flex-col h-full overflow-hidden">
+      <div className="px-4 py-3 border-b border-border text-sm font-medium text-muted-foreground shrink-0">
+        Conversation
+      </div>
 
-### `client/src/App.tsx` — Root layout and state orchestration
-
-> Current implementation note: `App.tsx` uses a fixed visible assistant label (`Voice AI`) plus `conversationActiveRef`, `turnInProgressRef`, and VAD control refs. `onSpeechEnd` pauses VAD, submits the WAV turn automatically, waits for AI audio playback, and restarts VAD only if the user has not clicked End.
-
-```tsx
-import { useState, useRef, useCallback } from 'react'
-import { WaveformCanvas } from './components/WaveformCanvas'
-import { Controls } from './components/Controls'
-import { LandingPopup } from './components/LandingPopup'
-import { SettingsPopup } from './components/SettingsPopup'
-import { TranscriptPanel, type TranscriptMessage } from './components/TranscriptPanel'
-import { useVAD } from './hooks/useVAD'
-import { useSession } from './hooks/useSession'
-import { useSSE } from './hooks/useSSE'
-import { Settings, PanelRight } from 'lucide-react'
-
-type ConvState = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'
-
-export default function App() {
-  const [convState, setConvState] = useState<ConvState>('idle')
-  const [showTranscript, setShowTranscript] = useState(false)
-  const [showSettings, setShowSettings] = useState(false)
-  const [messages, setMessages] = useState<TranscriptMessage[]>([])
-  const [aiName, setAiName] = useState('Assistant')
-  const [showLanding, setShowLanding] = useState(true)
-
-  const analyserRef = useRef<AnalyserNode | null>(null)
-  const audioCtxRef = useRef<AudioContext | null>(null)
-
-  const { sessionId, ready, initSession, getGuestId } = useSession()
-  const { sendTurn } = useSSE()
-
-  const handleSpeechEnd = useCallback(async (audio: Float32Array) => {
-    if (!sessionId || convState !== 'listening') return
-    const wav = float32ToWav(audio)
-    setConvState('transcribing')
-
-    await sendTurn(wav, sessionId, getGuestId(), {
-      onStatus: (state) => {
-        if (state === 'thinking') setConvState('thinking')
-        if (state === 'speaking') setConvState('speaking')
-        if (state === 'done') setConvState('listening') // auto-resume listening
-      },
-      onTranscriptUser: (text) =>
-        setMessages(m => [...m, { id: crypto.randomUUID(), role: 'user', text }]),
-      onTranscriptAI: (text) =>
-        setMessages(m => [...m, { id: crypto.randomUUID(), role: 'assistant', text }]),
-      onAudio: (base64, format) =>
-        playBase64Audio(base64, format, audioCtxRef, analyserRef),
-      onError: () => setConvState('idle'),
-      onDone: () => {},
-    })
-  }, [sessionId, convState, sendTurn, getGuestId])
-
-  const { start: startVAD, pause: pauseVAD } = useVAD(handleSpeechEnd)
-
-  const handleStart = () => {
-    initAudioContext(audioCtxRef, analyserRef)
-    startVAD()
-    setConvState('listening')
-  }
-
-  const handleStop = () => {
-    pauseVAD()
-    setConvState('idle')
-  }
-
-  const handleLandingContinue = async (email?: string) => {
-    const result = await initSession(email)
-    // Hydrate transcript from D1 history
-    const histRes = await fetch(`/api/history?session_id=${result.session_id}&limit=50`)
-    const { messages: history } = await histRes.json()
-    setMessages(history.map((m: any) => ({
-      id: crypto.randomUUID(),
-      role: m.role,
-      text: m.content,
-    })))
-    // Load AI config
-    const cfgRes = await fetch(`/api/config?guest_id=${getGuestId()}`)
-    const cfg = await cfgRes.json()
-    setAiName(cfg.ai_name)
-    setShowLanding(false)
-  }
-
-  return (
-    <div className="min-h-screen bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100">
-      <LandingPopup open={showLanding} onContinue={handleLandingContinue} />
-      <SettingsPopup
-        open={showSettings}
-        onClose={() => setShowSettings(false)}
-        aiName={aiName}
-        onSave={setAiName}
-        guestId={getGuestId()}
-      />
-
-      <div className={`h-screen flex ${showTranscript ? 'flex-row' : 'flex-col'}`}>
-
-        {/* Transcript panel (left column when toggled open) */}
-        {showTranscript && (
-          <div className="w-80 border-r border-gray-100 dark:border-gray-800 flex flex-col">
-            <div className="px-4 py-3 border-b border-gray-100 dark:border-gray-800 text-sm font-medium text-gray-500">
-              Conversation
-            </div>
-            <TranscriptPanel messages={messages} aiName={aiName} />
-          </div>
-        )}
-
-        {/* Main single-column layout */}
-        <div className="flex-1 flex flex-col items-center justify-between p-8">
-          <div className="w-full flex justify-between items-center">
-            <h1 className="text-sm font-medium text-gray-400">{aiName}</h1>
-            <div className="flex gap-2">
-              <button
-                onClick={() => setShowTranscript(s => !s)}
-                className={`p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition ${showTranscript ? 'text-indigo-500' : 'text-gray-400'}`}
-                title="Toggle transcript"
-              >
-                <PanelRight size={18} />
-              </button>
-              <button
-                onClick={() => setShowSettings(true)}
-                className="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 transition text-gray-400"
-                title="Settings"
-              >
-                <Settings size={18} />
-              </button>
-            </div>
-          </div>
-
-          <div className="w-full max-w-lg">
-            <WaveformCanvas state={convState} analyserNode={analyserRef.current} />
-          </div>
-
-          <Controls state={convState} onStart={handleStart} onStop={handleStop} />
-        </div>
+      <div className="flex-1 overflow-y-auto">
+        <Conversation>
+          <ConversationContent>
+            {messages.map((msg) => (
+              <Message key={msg.id} from={msg.role === 'user' ? 'user' : 'assistant'}>
+                <MessageContent>
+                  {msg.isStreaming && !msg.text ? (
+                    <Shimmer className="h-4 w-32" />
+                  ) : (
+                    <MessageResponse>
+                      {msg.text}
+                      {msg.isStreaming && (
+                        <span className="inline-block w-1 h-4 ml-0.5 bg-current animate-pulse" />
+                      )}
+                    </MessageResponse>
+                  )}
+                </MessageContent>
+              </Message>
+            ))}
+          </ConversationContent>
+        </Conversation>
+        <div ref={bottomRef} />
       </div>
     </div>
   )
 }
+```
 
-// ── Audio utilities ────────────────────────────────────────────────────────
+### `client/src/components/ConversationControls.tsx`
 
-function initAudioContext(
-  audioCtxRef: React.MutableRefObject<AudioContext | null>,
-  analyserRef: React.MutableRefObject<AnalyserNode | null>
-) {
-  if (!audioCtxRef.current) {
-    audioCtxRef.current = new AudioContext()
-    analyserRef.current = audioCtxRef.current.createAnalyser()
-    analyserRef.current.fftSize = 1024
-  }
+```tsx
+import { PanelLeft, Settings, Square } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { useVoiceStore } from '../store/voiceStore'
+
+interface Props {
+  onEnd: () => void
+  onSettingsOpen: () => void
 }
 
-async function playBase64Audio(
-  base64: string,
-  _format: string,
-  audioCtxRef: React.MutableRefObject<AudioContext | null>,
-  analyserRef: React.MutableRefObject<AnalyserNode | null>
-) {
-  if (!audioCtxRef.current) return
-  const binary = atob(base64)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
-  const audioBuffer = await audioCtxRef.current.decodeAudioData(bytes.buffer.slice(0))
-  const source = audioCtxRef.current.createBufferSource()
-  source.buffer = audioBuffer
-  if (analyserRef.current) {
-    source.connect(analyserRef.current)
-    analyserRef.current.connect(audioCtxRef.current.destination)
-  } else {
-    source.connect(audioCtxRef.current.destination)
-  }
-  source.start()
-}
+export function ConversationControls({ onEnd, onSettingsOpen }: Props) {
+  const { convState, showTranscript, toggleTranscript } = useVoiceStore()
+  const isActive = convState !== 'idle'
 
-function float32ToWav(samples: Float32Array, sampleRate = 16000): Blob {
-  const buffer = new ArrayBuffer(44 + samples.length * 2)
-  const view = new DataView(buffer)
-  const write = (o: number, s: string) => s.split('').forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0)))
-  write(0, 'RIFF')
-  view.setUint32(4, 36 + samples.length * 2, true)
-  write(8, 'WAVE'); write(12, 'fmt ')
-  view.setUint32(16, 16, true); view.setUint16(20, 1, true)
-  view.setUint16(22, 1, true)
-  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * 2, true)
-  view.setUint16(32, 2, true); view.setUint16(34, 16, true)
-  write(36, 'data'); view.setUint32(40, samples.length * 2, true)
-  const pcm = new Int16Array(buffer, 44)
-  for (let i = 0; i < samples.length; i++) pcm[i] = Math.max(-1, Math.min(1, samples[i])) * 0x7fff
-  return new Blob([buffer], { type: 'audio/wav' })
+  return (
+    <div className="flex items-center justify-between w-full max-w-sm">
+      {/* Transcript toggle */}
+      <Button
+        variant="ghost"
+        size="icon"
+        onClick={toggleTranscript}
+        className={showTranscript ? 'text-primary' : 'text-muted-foreground'}
+        title="Toggle transcript"
+      >
+        <PanelLeft size={18} />
+      </Button>
+
+      {/* End conversation button */}
+      <Button
+        variant="destructive"
+        size="sm"
+        onClick={onEnd}
+        className="flex items-center gap-2"
+      >
+        <Square size={14} fill="currentColor" />
+        End
+      </Button>
+
+      {/* Settings */}
+      <Button
+        variant="ghost"
+        size="icon"
+        onClick={onSettingsOpen}
+        className="text-muted-foreground"
+        title="Settings"
+      >
+        <Settings size={18} />
+      </Button>
+    </div>
+  )
 }
 ```
 
+### `client/src/App.tsx` — Root orchestration
+
+```tsx
+import { useState, useCallback } from 'react'
+import { LandingPopup } from './components/LandingPopup'
+import { PersonaView } from './components/PersonaView'
+import { TranscriptPanel } from './components/TranscriptPanel'
+import { ConversationControls } from './components/ConversationControls'
+import { SettingsPopup } from './components/SettingsPopup'
+import { Button } from '@/components/ui/button'
+import { useVoiceSession } from './hooks/useVoiceSession'
+import { useVoiceWebSocket } from './hooks/useVoiceWebSocket'
+import { useSpeechInput } from './hooks/useSpeechRecognition'
+import { useAudioPlayer } from './hooks/useAudioPlayer'
+import { useVoiceStore } from './store/voiceStore'
+import { Mic } from 'lucide-react'
+
+export default function App() {
+  const [showLanding, setShowLanding] = useState(true)
+  const [showSettings, setShowSettings] = useState(false)
+
+  const {
+    convState,
+    setConvState,
+    conversationStarted,
+    setConversationStarted,
+    showTranscript,
+    aiName,
+  } = useVoiceStore()
+
+  const { initSession } = useVoiceSession()
+  const { sendTranscript } = useVoiceWebSocket()
+
+  // Resume mic when TTS playback ends
+  const handleAudioEnd = useCallback(() => {
+    setConvState('listening')
+    startListening()
+  }, [])
+
+  useAudioPlayer({ onPlaybackEnd: handleAudioEnd })
+
+  // Speech recognition — disabled while AI is speaking to prevent feedback loop
+  const micEnabled = convState === 'listening' || convState === 'transcribing'
+
+  const { startListening, stopListening } = useSpeechInput({
+    enabled: micEnabled,
+    onFinalTranscript: (text) => {
+      sendTranscript(text)
+    },
+  })
+
+  const handleLandingContinue = async (email?: string) => {
+    await initSession(email)
+    setShowLanding(false)
+  }
+
+  const handleStartConversation = () => {
+    setConversationStarted(true)
+    setConvState('listening')
+    startListening()
+  }
+
+  const handleEndConversation = () => {
+    stopListening()
+    setConvState('idle')
+    setConversationStarted(false)
+  }
+
+  return (
+    <div className="min-h-screen bg-background text-foreground">
+      {/* Landing popup — shown until session is initialised */}
+      <LandingPopup open={showLanding} onContinue={handleLandingContinue} />
+
+      {/* Settings popup */}
+      <SettingsPopup
+        open={showSettings}
+        onClose={() => setShowSettings(false)}
+      />
+
+      {!conversationStarted ? (
+        // ── Hero state — single centered column ──────────────────────────
+        <div className="flex flex-col items-center justify-center min-h-screen gap-8 px-4">
+          <PersonaView aiName={aiName} />
+          <Button
+            size="lg"
+            onClick={handleStartConversation}
+            disabled={showLanding}
+            className="flex items-center gap-2 px-8 py-6 text-base rounded-full"
+          >
+            <Mic size={20} />
+            Start Conversation
+          </Button>
+        </div>
+
+      ) : (
+        // ── Active conversation — split or single column ──────────────────
+        <div className={`flex h-screen ${showTranscript ? 'flex-row' : 'flex-col'}`}>
+
+          {/* Transcript panel — left column when toggled on */}
+          {showTranscript && (
+            <div className="w-80 border-r border-border flex flex-col shrink-0">
+              <TranscriptPanel aiName={aiName} />
+            </div>
+          )}
+
+          {/* Persona column — always visible */}
+          <div className="flex-1 flex flex-col items-center justify-between py-12 px-6">
+            <div /> {/* spacer */}
+
+            <PersonaView aiName={aiName} />
+
+            <ConversationControls
+              onEnd={handleEndConversation}
+              onSettingsOpen={() => setShowSettings(true)}
+            />
+          </div>
+
+        </div>
+      )}
+    </div>
+  )
+}
+```
+
+### AI Elements installation commands
+
+```bash
+# Install Persona component
+npx ai-elements@latest add persona
+
+# Install Conversation + Message components
+npx ai-elements@latest add conversation
+npx ai-elements@latest add message
+
+# Install Shimmer (loading state)
+npx ai-elements@latest add shimmer
+```
+
+> **Important**: AI Elements components install into `src/components/ai-elements/` and become part of your codebase. They are not imported from `node_modules` — they are copy-pasted into your project by the CLI. This means full customisation is available, but you must install shadcn/ui first.
+
 ---
 
-## 8. Phase Build Plan
+## 9. Phase Build Plan
 
 ### Phase 1A — Project scaffold
 
-**Goal**: Unified project boots locally with `wrangler dev` serving both the Worker and the static SPA.
+**Goal**: Project boots, Vite and Wrangler run concurrently in local dev.
 
 Tasks:
-- [ ] `npm create cloudflare@latest voice-ai -- --type worker` (baseline scaffold)
-- [ ] Install dependencies: `hono`, `@cloudflare/workers-types`, `typescript`, `wrangler`
-- [ ] Install frontend dependencies: `react`, `react-dom`, `@vitejs/plugin-react`, `vite`, `tailwindcss`, `@ricky0123/vad-react`, `zustand`, `lucide-react`
-- [ ] Install shadcn/ui: `npx shadcn@latest init`
-- [ ] Create `wrangler.jsonc` (replace any generated `wrangler.toml`)
-- [ ] Create `vite.config.ts` with `outDir: '../dist'` (builds into project root `dist/`)
-- [ ] Create `tsconfig.json` (Worker) and `tsconfig.client.json` (React, extends root)
-- [ ] Add scripts to `package.json`:
-  ```json
-  {
-    "scripts": {
-      "dev:worker": "wrangler dev",
-      "dev:client": "vite client",
-      "dev": "concurrently \"npm run dev:worker\" \"npm run dev:client\"",
-      "build": "vite build client",
-      "deploy": "npm run build && wrangler deploy"
-    }
-  }
-  ```
-- [ ] Verify `wrangler dev` starts on `:8787` and Vite starts on `:5173`
+- [ ] `npm create cloudflare@latest voice-ai -- --type worker`
+- [ ] Delete generated `wrangler.toml`, create `wrangler.jsonc` per Section 4
+- [ ] Install all dependencies (see Section 10)
+- [ ] Set up `vite.config.ts` with `root: 'client'` and `outDir: '../dist'`
+- [ ] Set up `tsconfig.json` (Worker) and `tsconfig.client.json` (React)
+- [ ] Initialise shadcn/ui: `npx shadcn@latest init`
+- [ ] Add npm scripts: `dev`, `dev:worker`, `dev:client`, `build`, `deploy`
+- [ ] Verify `npm run dev` starts both Vite (:5173) and Wrangler (:8787)
 
 ---
 
-### Phase 1B — D1 database setup
+### Phase 1B — D1 database
 
-**Goal**: D1 database created, migrated, and queryable from the Worker.
+**Goal**: D1 created, migrated, and query helpers working.
 
 Tasks:
 - [ ] `npx wrangler d1 create voice-ai-db`
-- [ ] Copy `database_id` output into `wrangler.jsonc`
-- [ ] Create `db/0001_initial.sql` with full schema
-- [ ] Run migration locally: `npx wrangler d1 execute voice-ai-db --local --file=db/0001_initial.sql`
-- [ ] Run migration remotely: `npx wrangler d1 execute voice-ai-db --remote --file=db/0001_initial.sql`
-- [ ] Implement `src/lib/db.ts` with all query helpers
-- [ ] Test `upsertUser` and `getOrCreateSession` via a temporary test route
+- [ ] Paste `database_id` into `wrangler.jsonc`
+- [ ] Create `db/0001_initial.sql` (full schema from Section 3)
+- [ ] `npm run db:migrate:local` — apply migration to local D1
+- [ ] `npm run db:migrate:remote` — apply migration to remote D1
+- [ ] Implement `src/lib/db.ts` (all helpers from Section 5)
+- [ ] Test `upsertUser` and `getOrCreateSession` with a quick test script
 
 ---
 
-### Phase 1C — Backend routes
+### Phase 1C — HTTP API routes
 
-**Goal**: All API endpoints respond correctly.
+**Goal**: Session, history, and config endpoints fully working.
 
 Tasks:
 - [ ] Implement `src/types.ts`
-- [ ] Implement `src/index.ts` (Hono app, route registration, CORS)
+- [ ] Implement `src/lib/session.ts` (cookie helpers)
 - [ ] Implement `src/routes/session.ts`
-- [ ] Implement `src/routes/config.ts`
 - [ ] Implement `src/routes/history.ts`
-- [ ] Stub `src/routes/turn.ts` (return a fixed SSE sequence for now, no AI yet)
-- [ ] Test all endpoints with curl:
+- [ ] Implement `src/routes/config.ts`
+- [ ] Wire up Hono in `src/index.ts` (without DO export yet)
+- [ ] Test all endpoints via curl:
 
 ```bash
-# Session (guest)
-curl -X POST http://localhost:8787/api/session \
+# Create guest session
+curl -c cookies.txt -X POST http://localhost:8787/api/session \
   -H "Content-Type: application/json" \
-  -d '{"guest_id":"test-1234"}'
+  -d '{"guest_id":"test-uuid-001"}'
 # Expected: { session_id, user_id, is_new_user: true }
 
-# Session (email)
-curl -X POST http://localhost:8787/api/session \
+# Create email session
+curl -c cookies.txt -X POST http://localhost:8787/api/session \
   -H "Content-Type: application/json" \
-  -d '{"guest_id":"test-1234","email":"user@test.com"}'
+  -d '{"guest_id":"test-uuid-001","email":"test@example.com"}'
+# Expected: { session_id, user_id, is_new_user: false }
 
-# Config
-curl "http://localhost:8787/api/config?guest_id=test-1234"
-# Expected: { user_name: "", custom_instructions: "" }
+# Get config (uses cookie)
+curl -b cookies.txt http://localhost:8787/api/config
+# Expected: { ai_name: "Aria", system_prompt: "..." }
 
-# History
-curl "http://localhost:8787/api/history?session_id=SESSION_ID&limit=50"
+# Get history
+curl -b cookies.txt "http://localhost:8787/api/history?limit=50"
 # Expected: { messages: [] }
 ```
 
 ---
 
-### Phase 1D — AI pipeline
+### Phase 1D — Durable Object + WebSocket
 
-**Goal**: `/api/turn` accepts audio, runs the full STT→LLM→TTS pipeline, streams SSE events.
+**Goal**: WebSocket connects, turns process end-to-end via AI pipeline.
 
 Tasks:
-- [ ] Implement `src/lib/ai.ts` (full pipeline)
-- [ ] Implement `src/routes/turn.ts` (SSE streaming with real AI)
-- [ ] Test with a real WAV file:
+- [ ] Implement `src/lib/ai.ts` (`runLLM` and `runTTS`)
+- [ ] Implement `src/durable-objects/VoiceSession.ts`
+- [ ] Add DO export and `/ws` upgrade route to `src/index.ts`
+- [ ] Add DO migration to `wrangler.jsonc`
+- [ ] Test WebSocket connection:
 
 ```bash
-curl -X POST http://localhost:8787/api/turn \
-  -F "audio=@test.wav" \
-  -F "session_id=SESSION_ID" \
-  -F "guest_id=test-1234" \
-  --no-buffer
-# Expected: stream of SSE events ending with status=done
+# Using websocat (npm i -g websocat)
+websocat "ws://localhost:8787/ws?session_id=SESSION_ID_FROM_STEP_1C"
+# Type: {"type":"ping"}
+# Expected: {"type":"pong"}
+# Type: {"type":"transcript","text":"Hello, how are you?"}
+# Expected: stream of status/llm_chunk/audio messages
 ```
 
-- [ ] Confirm D1 `messages` table is populated after each turn
-- [ ] Confirm base64 audio in the `audio` SSE event decodes to audible WAV
+- [ ] Verify messages are saved to D1 after each turn
+- [ ] Verify base64 audio from Deepgram Aura-1 decodes to audible MP3
 
 ---
 
 ### Phase 2A — Frontend skeleton
 
-**Goal**: React SPA builds, loads in browser, landing popup works.
+**Goal**: React app loads, landing popup works, session initialises.
 
 Tasks:
-- [ ] Create `client/index.html`, `client/src/main.tsx`, `client/src/App.tsx` (minimal)
-- [ ] Copy Silero VAD static assets to `client/public/`: `silero_vad.onnx`, `vad.worklet.bundle.js`
-- [ ] Implement `useSession` hook
-- [ ] Implement `LandingPopup` component
-- [ ] On submit: call `/api/session`, load history from `/api/history`, load config from `/api/config`
-- [ ] Store `session_id` in React state; verify it survives page refresh (localStorage UUID stays stable)
-- [ ] `npm run build` → confirm `dist/` is populated
-- [ ] Verify Workers Assets serves `dist/index.html` on `http://localhost:8787/`
+- [ ] Create `client/index.html`, `client/src/main.tsx`
+- [ ] Set up Tailwind in `client/src`
+- [ ] Install AI Elements components (see installation commands in Section 8)
+- [ ] Implement `voiceStore.ts` (Zustand)
+- [ ] Implement `useVoiceSession.ts` hook
+- [ ] Implement `LandingPopup.tsx` component
+- [ ] Implement minimal `App.tsx` — shows popup, calls `initSession`, dismisses
+- [ ] Verify: guest UUID stable in localStorage across page refreshes
+- [ ] Verify: session cookie set on session init, survives page refresh
 
 ---
 
-### Phase 2B — Voice pipeline integration
+### Phase 2B — WebSocket + speech recognition
 
-**Goal**: User speaks → AI responds with audio.
+**Goal**: User speaks → AI responds via full pipeline.
 
 Tasks:
-- [ ] Implement `useVAD` hook
-- [ ] Implement `useSSE` hook
-- [ ] Implement `float32ToWav` utility
-- [ ] Implement `playBase64Audio` utility with `AnalyserNode` connection
-- [ ] Wire up full turn cycle in `App.tsx`
-- [ ] Test full round trip: speak → see state transitions → hear AI response
+- [ ] Implement `useVoiceWebSocket.ts` hook
+- [ ] Implement `useSpeechRecognition.ts` hook
+- [ ] Implement `useAudioPlayer.ts` hook
+- [ ] Wire up full conversation loop in `App.tsx`
+- [ ] Test: speak a sentence → see `thinking` → hear AI audio response
+- [ ] Verify: mic stops while AI is speaking (feedback loop prevention)
+- [ ] Verify: mic resumes automatically after audio playback ends
+- [ ] Verify: `finalTranscript` triggers send (no manual button needed)
 
 ---
 
-### Phase 2C — Waveform visualizer
+### Phase 2C — Persona + UI states
 
-**Goal**: Sine wave canvas animates correctly per state, colors shift between user and AI.
+**Goal**: Persona animation responds correctly to all conversation states.
 
 Tasks:
-- [ ] Implement `useWaveform` hook
-- [ ] Implement `WaveformCanvas` component
-- [ ] Connect `AnalyserNode` to mic stream during `listening`
-- [ ] Connect `AnalyserNode` to TTS audio source during `speaking`
-- [ ] Verify: indigo wave during user speech, emerald wave during AI speech
-- [ ] Verify: breathing animation during `transcribing` / `thinking`
+- [ ] Implement `PersonaView.tsx` using AI Elements `Persona` component
+- [ ] Wire `convState` from Zustand → `PERSONA_STATE_MAP` → Persona `state` prop
+- [ ] Verify all 5 states animate: asleep (idle) → listening → thinking → speaking → asleep
+- [ ] Verify interim transcript text appears below Persona while user speaks
+- [ ] Verify status labels update per state
 
 ---
 
-### Phase 3A — Controls and settings
+### Phase 3A — Transcript panel
 
-**Goal**: Full controls and settings popup functional.
+**Goal**: Transcript split-view works with live streaming and history.
 
 Tasks:
-- [ ] Implement `Controls` component
-- [ ] Implement `SettingsPopup` component (user preferred name + custom AI instructions)
-- [ ] On settings save: `POST /api/config`, persist `user_name` and `custom_instructions`
-- [ ] On settings open: pre-fill from current state (loaded at session init)
-- [ ] Confirm custom instructions are appended to the protected base system prompt on the next turn
+- [ ] Implement `TranscriptPanel.tsx` using AI Elements `Conversation` + `Message`
+- [ ] Verify: `PanelLeft` toggle switches layout between single/two-column
+- [ ] Verify: user messages appear on `transcript_confirmed` WS event
+- [ ] Verify: AI messages stream in word-by-word from `llm_chunk` events
+- [ ] Verify: Shimmer shown while AI message is empty but streaming
+- [ ] Verify: history from D1 populates panel on session resume
+- [ ] Verify: auto-scroll to bottom on new message
 
 ---
 
-### Phase 3B — Transcript panel
-
-**Goal**: Split-view transcript works with real-time updates and history hydration.
+### Phase 3B — Controls, settings, and polish
 
 Tasks:
-- [ ] Implement `TranscriptPanel` component
-- [ ] `PanelRight` icon button toggles `showTranscript` → layout shifts to `flex-row`
-- [ ] Messages append in real-time from SSE `transcript_user` and `transcript_ai` events
-- [ ] Auto-scroll to bottom on new message
-- [ ] Confirm history messages loaded from D1 on session init populate the panel correctly
-
----
-
-### Phase 3C — Polish and edge cases
-
-Tasks:
-- [ ] Handle microphone permission denied — show clear error message
-- [ ] Prevent overlapping turns — disable VAD while `speaking`, re-enable on `done`
-- [ ] Handle empty STT result — show a brief toast, return to `listening`
-- [ ] Handle Worker pipeline errors (SSE `error` event) — show toast, return to `idle`
-- [ ] Add loading skeleton / spinner during session init (before landing popup dismisses)
-- [ ] Dark mode (Tailwind `dark:` throughout all components)
-- [ ] Mobile responsive: hide transcript panel toggle on screens < `sm`, single column only
+- [ ] Implement `ConversationControls.tsx`
+- [ ] Implement `SettingsPopup.tsx` (AI name + system prompt form, POST /api/config)
+- [ ] Hero → conversation layout transition (smooth, no flicker)
+- [ ] Handle microphone permission denied gracefully (inline error, not alert)
+- [ ] Handle WebSocket disconnection gracefully (auto-reconnect, status indicator)
+- [ ] Handle unsupported browser (non-Chrome) — show clear message
+- [ ] Dark mode support (Tailwind `dark:` throughout)
+- [ ] Mobile: single column always (hide transcript toggle on mobile, `sm:` breakpoint)
 - [ ] Add `<meta>` tags in `client/index.html` (title, description, viewport)
+- [ ] Empty state in transcript panel ("Start talking to begin...")
 
 ---
 
-## 9. Environment & Local Dev
+## 10. Environment & Local Dev
+
+### `package.json`
+
+```json
+{
+  "name": "voice-ai",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev:worker": "wrangler dev",
+    "dev:client": "vite",
+    "dev": "concurrently \"npm run dev:worker\" \"npm run dev:client\"",
+    "build": "vite build",
+    "deploy": "npm run build && wrangler deploy",
+    "db:migrate:local": "wrangler d1 execute voice-ai-db --local --file=db/0001_initial.sql",
+    "db:migrate:remote": "wrangler d1 execute voice-ai-db --remote --file=db/0001_initial.sql"
+  },
+  "dependencies": {
+    "hono": "^4.0.0",
+    "react": "^18.0.0",
+    "react-dom": "^18.0.0",
+    "react-speech-recognition": "^3.10.0",
+    "zustand": "^4.0.0",
+    "lucide-react": "^0.400.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0",
+    "@cloudflare/workers-types": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^5.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "tailwindcss": "^3.0.0",
+    "autoprefixer": "^10.0.0",
+    "postcss": "^8.0.0",
+    "concurrently": "^8.0.0",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "@types/react-speech-recognition": "^3.9.0"
+  }
+}
+```
 
 ### `vite.config.ts`
 
@@ -1526,57 +2074,25 @@ export default defineConfig({
     alias: { '@': path.resolve(__dirname, 'client/src') }
   },
   build: {
-    outDir: '../dist',   // builds into project root dist/
+    outDir: '../dist',
     emptyOutDir: true,
   },
   server: {
     port: 5173,
     proxy: {
-      // In local dev: forward /api/* to the Worker running on :8787
+      // Forward API and WebSocket calls to Wrangler dev server in local dev
       '/api': {
         target: 'http://localhost:8787',
         changeOrigin: true,
-      }
-    }
-  }
+      },
+      '/ws': {
+        target: 'ws://localhost:8787',
+        ws: true,           // WebSocket proxy
+        changeOrigin: true,
+      },
+    },
+  },
 })
-```
-
-### `package.json`
-
-```json
-{
-  "name": "voice-ai",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "dev:worker": "wrangler dev",
-    "dev:client": "vite client",
-    "dev": "concurrently \"npm run dev:worker\" \"npm run dev:client\"",
-    "build": "vite build",
-    "deploy": "npm run build && wrangler deploy",
-    "db:migrate:local": "wrangler d1 execute voice-ai-db --local --file=db/0001_initial.sql",
-    "db:migrate:remote": "wrangler d1 execute voice-ai-db --remote --file=db/0001_initial.sql"
-  },
-  "dependencies": {
-    "hono": "^4.0.0",
-    "react": "^18.0.0",
-    "react-dom": "^18.0.0",
-    "@ricky0123/vad-react": "^0.0.19",
-    "zustand": "^4.0.0",
-    "lucide-react": "^0.400.0"
-  },
-  "devDependencies": {
-    "wrangler": "^3.0.0",
-    "@cloudflare/workers-types": "^4.0.0",
-    "typescript": "^5.0.0",
-    "vite": "^5.0.0",
-    "@vitejs/plugin-react": "^4.0.0",
-    "tailwindcss": "^3.0.0",
-    "autoprefixer": "^10.0.0",
-    "concurrently": "^8.0.0"
-  }
-}
 ```
 
 ### `tsconfig.json` (Worker)
@@ -1617,124 +2133,125 @@ export default defineConfig({
 
 ---
 
-## 10. Deployment
+## 11. Deployment
 
 ```bash
 # ── One-time setup ─────────────────────────────────────────────────────────
 
 # 1. Create D1 database
 npx wrangler d1 create voice-ai-db
-# → Copy the database_id into wrangler.jsonc
+# → Copy database_id into wrangler.jsonc
 
 # 2. Run D1 migration on remote
 npm run db:migrate:remote
 
+# 3. Set production secrets
+npx wrangler secret put COOKIE_SECRET
+# → Enter a long random string (32+ chars)
+
 # ── Every deploy ───────────────────────────────────────────────────────────
 
-# 3. Build React SPA + deploy Worker + Assets in one command
+# 4. Build SPA + deploy Worker + Assets in one command
 npm run deploy
-# Internally: vite build → dist/ → wrangler deploy (uploads Worker + assets)
+# Internally: vite build → dist/ → wrangler deploy
 
 # ── Result ─────────────────────────────────────────────────────────────────
 # https://voice-ai.YOUR-ACCOUNT.workers.dev
-# - GET /          → React SPA (served from Workers Assets CDN)
-# - POST /api/*    → Hono Worker routes
-# - All other GET  → index.html (SPA fallback via not_found_handling)
+# GET  /        → React SPA (Workers Assets CDN)
+# POST /api/*   → Hono HTTP routes
+# GET  /ws      → WebSocket upgrade → Durable Object
+# GET  /*       → index.html (SPA fallback)
 ```
 
 ### Custom domain (optional)
 
-In the Cloudflare dashboard: Workers & Pages → voice-ai → Settings → Domains & Routes → Add Custom Domain.
-
-### No CORS config needed in production
-
-Frontend and API share the same origin in production (both on `workers.dev` or your custom domain). The `cors()` middleware in `src/index.ts` is scoped to local dev only.
+Cloudflare dashboard → Workers & Pages → voice-ai → Settings → Domains & Routes → Add Custom Domain.
 
 ---
 
-## 11. ADRs — Architecture Decision Records
+## 12. ADRs — Architecture Decision Records
 
-### ADR-001: Turn-based voice over real-time duplex streaming
+### ADR-001: Web Speech API (browser STT) over Cloudflare Whisper
 
 **Status**: Accepted
 
-**Context**: Voice AI can be turn-based (one party speaks at a time, like a phone call) or real-time duplex (both parties can interrupt simultaneously). Cloudflare Workers have a 30-second CPU time limit and operate in a request/response model without persistent connections.
+**Context**: STT can happen in the browser via Web Speech API or server-side via Cloudflare Whisper (`@cf/openai/whisper-large-v3-turbo`). Whisper requires sending an audio blob to the Worker (~100-500KB per turn) and then waiting for GPU inference (~1-3 seconds). Web Speech API transcribes speech locally in real-time, using the browser's built-in engine (Google's engine in Chrome), and fires `finalTranscript` the moment a natural pause is detected.
 
-**Decision**: Turn-based with Silero VAD silence detection. The browser records until VAD fires `onSpeechEnd`, then sends the full audio clip as a single HTTP request.
+**Decision**: Use Web Speech API via `react-speech-recognition`. Skip Cloudflare Whisper entirely.
 
-**Consequences**: Clean request/response fits Workers' execution model. No WebSocket or WebRTC infrastructure needed. 1–2 second AI processing latency feels natural for a turn-based exchange. Real-time duplex can be added in a future version via Durable Objects with WebSockets.
+**Consequences**: STT latency drops to near-zero — the LLM starts immediately after the user pauses. The trade-off is that audio is processed by Google's servers in Chrome (privacy implication), and browser support is best in Chrome/Edge. The Whisper step can be added back as a quality upgrade later, or used as a fallback for non-Chrome browsers. For v1 the latency benefit is decisive.
 
 ---
 
-### ADR-002: Silero VAD over energy-threshold silence detection
+### ADR-002: react-speech-recognition over voice-activity-detection library
 
 **Status**: Accepted
 
-**Context**: Two options for detecting speech end: (1) monitor audio energy, stop after N ms below a threshold — zero dependencies, unreliable in noise; (2) `@ricky0123/vad-web` Silero WASM model, ~1MB, ML-based speech detection.
+**Context**: `voice-activity-detection` (npm) is an energy/frequency threshold VAD that fires callbacks when it detects voice start/stop. It requires a separate recording step and manual audio encoding. `react-speech-recognition` wraps the Web Speech API and provides `interimTranscript` (live) and `finalTranscript` (phrase complete) — it handles VAD, recording, transcription, and silence detection in one hook.
 
-**Decision**: Silero VAD.
+**Decision**: Use `react-speech-recognition`.
 
-**Consequences**: ~1MB WASM bundle loaded once and cached. Silero is trained specifically for speech vs non-speech and handles background noise accurately. Energy threshold causes frequent false mid-sentence cutoffs which would severely damage conversation flow. Accuracy is clearly worth the bundle cost.
+**Consequences**: One library handles the entire browser-side speech pipeline. `continuous: true` mode keeps the mic open between phrases. `finalTranscript` fires automatically when the browser detects a natural pause — no threshold tuning needed. `interimTranscript` streams live text to the UI, giving the user real-time feedback that they're being heard. No WASM bundles, no separate VAD config.
 
 ---
 
-### ADR-003: Full Cloudflare-native AI stack
+### ADR-003: Durable Objects for WebSocket over plain Worker WebSocket
 
 **Status**: Accepted
 
-**Context**: OpenAI Whisper API, GPT-4o, and ElevenLabs offer higher quality STT, LLM, and TTS. Cloudflare Workers AI offers lower-quality equivalents but keeps the entire stack on one platform.
+**Context**: Cloudflare Workers are stateless and ephemeral — they cannot maintain a persistent WebSocket connection. Two options: (1) plain Worker WebSocket (connection drops after the request handler completes); (2) Durable Objects with Hibernation WebSocket API (connection persists, DO hibernates when idle to save cost).
 
-**Decision**: Cloudflare Workers AI for all three (Whisper, Llama 3.1 8B, MeloTTS) in v1.
+**Decision**: Durable Objects with Hibernation API. One DO instance per user session, identified by `session_id`.
 
-**Consequences**: No external API keys, no external billing, no cross-service egress latency. Voice and LLM quality are lower than best-in-class. Each step is a single function call in `ai.ts` — any step can be swapped to an external provider independently without changing the SSE contract to the frontend.
+**Consequences**: WebSocket connection persists for the lifetime of the user's session. DO hibernates when no messages are in flight, keeping costs low. The AI pipeline runs inside the DO — it has access to `env.AI` and `env.DB` bindings directly. State (`processing`, `sessionId`, `userId`) is held in DO memory during a turn. Hono in the Worker handles HTTP routing and forwards the WS upgrade to the DO.
 
 ---
 
-### ADR-004: Single unified project over monorepo
+### ADR-004: Deepgram Aura-1 over MeloTTS for TTS
 
 **Status**: Accepted
 
-**Context**: Frontend and backend can be separated as a monorepo (two `package.json`, Turborepo, separate build commands) or kept as a single project (one `package.json`, one build, one deploy).
+**Context**: Two TTS options are available on Cloudflare Workers AI: `@cf/myshell-ai/melotts` (free-tier friendly, robotic quality) and `@cf/deepgram/aura-1` (Deepgram partner model, natural speech, multiple voices, $0.0150/1k chars).
 
-**Decision**: Single unified project.
+**Decision**: Deepgram Aura-1 with `aura-asteria-en` voice.
 
-**Consequences**: One `wrangler.jsonc` defines the entire deployable unit. `npm run deploy` builds the SPA and deploys the Worker + Assets in one command. Simpler for AI agents to execute — no workspace coordination, no cross-package imports needed. Monorepo can be adopted later if the project grows significantly.
+**Consequences**: Noticeably more natural and human-sounding AI voice. Slightly higher cost per conversation. The voice model is a single parameter — can be changed to any Aura variant (`aura-orion-en`, `aura-luna-en`, `aura-zeus-en`) or swapped back to MeloTTS by changing one function call in `src/lib/ai.ts`. Natural voice quality is critical to the conversational feel of the app.
 
 ---
 
-### ADR-005: Workers Assets over Cloudflare Pages
+### ADR-005: Mic feedback loop prevention via state-gated listening
 
 **Status**: Accepted
 
-**Context**: Two ways to serve a static SPA alongside a Worker: (1) Cloudflare Pages with a Worker integration; (2) Workers Assets — the `assets` binding in `wrangler.jsonc` that serves static files from the same Worker.
+**Context**: When the AI's TTS audio plays through the speakers, the microphone can pick it up, causing the speech recognition to transcribe the AI's own speech and trigger another LLM turn — an infinite loop.
 
-**Decision**: Workers Assets.
+**Decision**: Stop `SpeechRecognition` while `convState` is `speaking`. The `useSpeechInput` hook accepts an `enabled` prop — it is `false` when the Persona is in speaking state. `useAudioPlayer` fires `onPlaybackEnd` when the audio finishes, which calls `startListening()` to resume the mic.
 
-**Consequences**: Single deployment unit. Cloudflare now recommends Workers Assets over Pages for new full-stack Worker projects. The `not_found_handling: "single-page-application"` option handles the React Router fallback automatically. No separate Pages project, no Pages-specific build pipeline or environment variables.
+**Consequences**: Clean turn-taking. No echo or feedback loops. Users with headphones will not experience this issue at all, but the guard is needed for users on speakers. The mic resumes within ~100ms of audio playback ending.
 
 ---
 
-### ADR-006: wrangler.jsonc over wrangler.toml
+### ADR-006: Zustand over React Context for global voice state
 
 **Status**: Accepted
 
-**Context**: Wrangler supports three config formats: `wrangler.toml` (legacy default), `wrangler.json` (JSON, no comments), `wrangler.jsonc` (JSON with Comments, current default).
+**Context**: Voice AI has complex, deeply nested shared state: `convState`, `messages`, `interimText`, `sessionId`, `showTranscript`, `aiConfig`. Managing this with `useState` + prop drilling across `App` → `PersonaView` → `TranscriptPanel` → `Controls` would require deeply nested props or a Context. React Context causes full subtree re-renders on every state change — undesirable given `interimText` updates on every word spoken.
 
-**Decision**: `wrangler.jsonc`.
+**Decision**: Zustand store (`voiceStore.ts`) as global state manager.
 
-**Consequences**: Cloudflare's own `wrangler init` and documentation now default to `wrangler.jsonc`. Comments allow inline documentation of bindings, database IDs, and feature flags directly in the config — critical for maintainability and AI agent comprehension. `wrangler.toml` still works but is not recommended for new projects.
+**Consequences**: Any component can subscribe to only the slice of state it needs, with no prop drilling and minimal re-renders. `interimText` updates every 100ms during speech — Zustand's granular subscriptions mean only `PersonaView` re-renders for this, not the whole tree. The store is also accessible outside React (in hooks and audio event listeners) via `useVoiceStore.getState()`.
 
 ---
 
-### ADR-007: Same-origin deployment — no CORS in production
+### ADR-007: AI Elements components over custom UI
 
 **Status**: Accepted
 
-**Context**: When frontend and backend are separate deployments (e.g. Vercel + CF Workers), CORS headers are required for every API call. With Workers Assets, both are served from the same `workers.dev` subdomain.
+**Context**: The Persona (animated AI avatar) and Conversation/Message (transcript display) components could be built from scratch or sourced from the AI Elements library.
 
-**Decision**: No CORS headers in production. `cors()` middleware in Hono is restricted to `/api/*` and only applies during local development.
+**Decision**: Use AI Elements `Persona`, `Conversation`, `Message`, and `Shimmer` components.
 
-**Consequences**: Fewer headers per request, no preflight round-trips, no risk of CORS misconfiguration blocking API calls in production. Local development uses Vite's `proxy` config to forward `/api/*` to the Worker port, maintaining same-origin behaviour locally as well.
+**Consequences**: The `Persona` component provides 5 animated states (idle/listening/thinking/speaking/asleep) powered by Rive WebGL2 — building this from scratch would take significant effort. The `Conversation` and `Message` components provide a polished chat-style layout that matches the transcript requirement. AI Elements components are installed into the codebase (not imported from `node_modules`), giving full customisation access. The library is built on shadcn/ui which is already in the stack — zero additional style conflicts.
 
 ---
 

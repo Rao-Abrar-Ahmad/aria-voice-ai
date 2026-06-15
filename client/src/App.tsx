@@ -11,6 +11,7 @@ import { useVoiceSession } from './hooks/useVoiceSession'
 import { useVoiceWebSocket } from './hooks/useVoiceWebSocket'
 import { useVoiceStore } from './store/voiceStore'
 import 'regenerator-runtime/runtime'
+import Header from './components/Header'
 
 const GREETING_TEXT = "Hi, I'm Aria. How's your day going?"
 const GREETING_AUDIO_URL = '/audio/aria-greeting.mp3'
@@ -144,6 +145,7 @@ export default function App() {
     <div className="min-h-screen overflow-hidden bg-zinc-50 text-zinc-950 transition-colors dark:bg-zinc-950 dark:text-zinc-50">
       <LandingPopup open={!checkingSession && showLanding} onContinue={handleLandingContinue} />
       <SettingsPopup open={showSettings} onClose={() => setShowSettings(false)} />
+      <Header />
 
       {initializing && (
         <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/60 backdrop-blur-md">
