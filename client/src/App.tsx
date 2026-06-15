@@ -145,7 +145,7 @@ export default function App() {
     <div className="min-h-screen overflow-hidden bg-zinc-50 text-zinc-950 transition-colors dark:bg-zinc-950 dark:text-zinc-50">
       <LandingPopup open={!checkingSession && showLanding} onContinue={handleLandingContinue} />
       <SettingsPopup open={showSettings} onClose={() => setShowSettings(false)} />
-      <Header />
+
 
       {initializing && (
         <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-3 bg-black/60 backdrop-blur-md">
@@ -155,7 +155,8 @@ export default function App() {
       )}
 
       {!active ? (
-        <main className="flex min-h-screen flex-col items-center justify-center gap-8 px-4">
+        <main className="flex min-h-screen flex-col items-center justify-evenly gap-8 px-4">
+          <Header />
           <PersonaView />
           <button
             onClick={handleStartConversation}
