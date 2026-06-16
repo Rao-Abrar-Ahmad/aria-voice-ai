@@ -17,6 +17,9 @@ export async function* runLLM(ai: Ai, history: Message[], config: AiConfig): Asy
     throw new Error('LLM service unavailable. Please try again.');
   }
 
+  console.log(result);
+  console.log(result?.chocies);
+
   const response = (result?.choices?.[0]?.message?.content ?? result?.response ?? '').trim()
   const chunks = response.match(/\S+\s*/g) ?? [response]
 

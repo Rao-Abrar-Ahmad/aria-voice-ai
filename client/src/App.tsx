@@ -257,7 +257,7 @@ export default function App() {
     socket.close()
     resetConversation()
   }
-
+  console.log(error)
   return (
     <div className="min-h-screen overflow-hidden bg-zinc-50 text-zinc-950 transition-colors dark:bg-zinc-950 dark:text-zinc-50">
       <LandingPopup open={!checkingSession && showLanding} onContinue={handleLandingContinue} />

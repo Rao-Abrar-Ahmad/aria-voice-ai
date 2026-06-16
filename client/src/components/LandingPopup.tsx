@@ -13,7 +13,7 @@ export function LandingPopup({ open, onContinue }: Props) {
     <Dialog open={open}>
       <DialogContent className="sm:max-w-sm" hideClose>
         <DialogHeader>
-          <DialogTitle className="text-center text-xl font-bold tracking-tight">Voice AI</DialogTitle>
+          <DialogTitle className="text-center text-xl font-bold tracking-tight">Aria AI</DialogTitle>
           <DialogDescription className="text-center text-sm text-zinc-500 dark:text-zinc-400">
             Sign in with email or continue as a guest to start voice interaction.
           </DialogDescription>
