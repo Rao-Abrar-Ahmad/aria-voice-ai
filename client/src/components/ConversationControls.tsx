@@ -29,8 +29,8 @@ export function ConversationControls({ onEnd, onSettingsOpen }: Props) {
       >
         <Settings size={18} />
       </button> */}
-      <div className="flex h-11 min-w-32 items-center justify-center rounded-full border border-zinc-200 bg-white px-4 text-sm font-medium text-zinc-600 shadow-sm dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300">
-        {convState === 'idle' ? 'Ready' : convState}
+      <div className="flex h-11 min-w-32 items-center justify-center rounded-full border border-zinc-200 bg-white px-4 text-sm font-medium text-zinc-600 shadow-sm dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-300 capitalize">
+        {convState === 'idle' ? 'Ready' : convState + "..."}
       </div>
       <button
         type="button"
