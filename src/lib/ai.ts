@@ -5,16 +5,13 @@ import { chatgpt_ai_system_prompt } from './example-system-prompts'
 const default_systemPrompt = chatgpt_ai_system_prompt;
 
 export async function* runLLM(ai: Ai, history: Message[], config: AiConfig): AsyncGenerator<string, string> {
-  const result = (await ai.run('@cf/qwen/qwen3-30b-a3b-fp8', {
+  const result = (await ai.run('@cf/openai/gpt-oss-20b', {
     messages: [{ role: 'system', content: default_systemPrompt }, ...history],
     max_tokens: 300,
     temperature: 0.7
   })) as any;
 
-  // Qwen3 "thinking" models wrap chain-of-thought in <think>…</think> tags.
-  // Strip those blocks so we only keep the actual answer.
-  const raw = (result?.response ?? '').toString()
-  const response = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  const response = (result?.response ?? '').trim()
   const chunks = response.match(/\S+\s*/g) ?? [response]
 
   for (const chunk of chunks) {
