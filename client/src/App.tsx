@@ -36,6 +36,101 @@ export default function App() {
   const greetingPlayedRef = useRef(false)
   const playingGreetingRef = useRef(false)
 
+  // Microphone testing states and refs
+  const [micState, setMicState] = useState<'idle' | 'requesting' | 'testing' | 'ready'>('idle')
+  const [audioLevels, setAudioLevels] = useState<number[]>([4, 4, 4, 4, 4, 4, 4, 4, 4, 4])
+  const testStreamRef = useRef<MediaStream | null>(null)
+  const audioCtxRef = useRef<AudioContext | null>(null)
+  const analyserRef = useRef<AnalyserNode | null>(null)
+  const animationFrameRef = useRef<number | null>(null)
+
+  const cleanupMicTest = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current)
+      animationFrameRef.current = null
+    }
+    if (testStreamRef.current) {
+      testStreamRef.current.getTracks().forEach((track) => track.stop())
+      testStreamRef.current = null
+    }
+    if (audioCtxRef.current) {
+      if (audioCtxRef.current.state !== 'closed') {
+        void audioCtxRef.current.close()
+      }
+      audioCtxRef.current = null
+    }
+    analyserRef.current = null
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      cleanupMicTest()
+    }
+  }, [cleanupMicTest])
+
+  const startMicTest = async () => {
+    setMicState('requesting')
+    setError('')
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      testStreamRef.current = stream
+      setMicState('testing')
+
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext
+      if (!AudioContextClass) {
+        setMicState('ready')
+        return
+      }
+
+      const audioCtx = new AudioContextClass()
+      const analyser = audioCtx.createAnalyser()
+      analyser.fftSize = 64
+      const source = audioCtx.createMediaStreamSource(stream)
+      source.connect(analyser)
+
+      audioCtxRef.current = audioCtx
+      analyserRef.current = analyser
+
+      const bufferLength = analyser.frequencyBinCount
+      const dataArray = new Uint8Array(bufferLength)
+
+      let voiceDetectedTime = 0
+      const updateVolume = () => {
+        if (!analyserRef.current) return
+        analyserRef.current.getByteFrequencyData(dataArray)
+
+        let sum = 0
+        for (let i = 0; i < bufferLength; i++) {
+          sum += dataArray[i]
+        }
+        const average = sum / bufferLength
+
+        const newLevels = Array.from({ length: 10 }).map((_, index) => {
+          const frequencyValue = dataArray[index % bufferLength] || 0
+          return Math.max(4, Math.round((frequencyValue / 255) * 100))
+        })
+        setAudioLevels(newLevels)
+
+        // Threshold of average volume to identify active voice/input
+        if (average > 10) {
+          voiceDetectedTime++
+          if (voiceDetectedTime > 5) {
+            setMicState('ready')
+          }
+        }
+
+        animationFrameRef.current = requestAnimationFrame(updateVolume)
+      }
+
+      animationFrameRef.current = requestAnimationFrame(updateVolume)
+    } catch (err: any) {
+      console.error('Error accessing microphone:', err)
+      setError('Microphone access denied. Please allow microphone access in your browser to start.')
+      setMicState('idle')
+    }
+  }
+
   const handleAudioEnded = useCallback(() => {
     if (playingGreetingRef.current) {
       playingGreetingRef.current = false
@@ -108,7 +203,7 @@ export default function App() {
     }
   }
 
-  const handleStartConversation = () => {
+  const proceedToStartConversation = () => {
     if (!speech.supported) {
       setError('This browser does not support Web Speech recognition. Chrome or Edge is recommended.')
       return
@@ -132,6 +227,28 @@ export default function App() {
       setConvState('listening')
       setError('Greeting audio is missing. Run npm run generate:greeting to create it.')
     })
+  }
+
+  const handleStartConversationClick = async () => {
+    setError('')
+    if (navigator.permissions && navigator.permissions.query) {
+      try {
+        const result = await navigator.permissions.query({ name: 'microphone' as PermissionName })
+        if (result.state === 'granted') {
+          proceedToStartConversation()
+          return
+        }
+      } catch (err) {
+        console.warn('Permissions API query for microphone not supported:', err)
+      }
+    }
+    await startMicTest()
+  }
+
+  const handleDoneTesting = () => {
+    cleanupMicTest()
+    setMicState('idle')
+    proceedToStartConversation()
   }
 
   const handleEndConversation = () => {
@@ -158,18 +275,69 @@ export default function App() {
         <main className="flex min-h-screen flex-col items-center justify-evenly gap-8 px-4">
           <Header />
           <PersonaView />
-          <button
-            onClick={handleStartConversation}
-            disabled={checkingSession || showLanding || initializing}
-            className="inline-flex items-center gap-2 rounded-full bg-teal-600 px-8 py-4 text-base font-semibold text-white shadow-lg shadow-teal-600/20 transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            <Mic size={20} />
-            Start Conversation
-          </button>
-          {error && <p className="max-w-md text-center text-sm text-red-600 dark:text-red-300">{error}</p>}
-          {!speech.microphoneAvailable && (
-            <p className="max-w-md text-center text-sm text-red-600 dark:text-red-300">Microphone permission is unavailable.</p>
-          )}
+
+          <div className="flex flex-col items-center gap-4 w-full max-w-sm">
+            {micState === 'idle' && (
+              <button
+                onClick={handleStartConversationClick}
+                disabled={checkingSession || showLanding || initializing}
+                className="inline-flex items-center gap-2 rounded-full bg-teal-600 px-8 py-4 text-base font-semibold text-white shadow-lg shadow-teal-600/20 transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Mic size={20} />
+                Start Conversation
+              </button>
+            )}
+
+            {micState === 'requesting' && (
+              <button
+                disabled
+                className="inline-flex items-center gap-3 rounded-full bg-zinc-200 px-8 py-4 text-base font-semibold text-zinc-500 shadow-md dark:bg-zinc-800 dark:text-zinc-400"
+              >
+                <div className="h-5 w-5 animate-spin rounded-full border-2 border-zinc-500 border-t-transparent dark:border-zinc-400" />
+                Permission Needed...
+              </button>
+            )}
+
+            {(micState === 'testing' || micState === 'ready') && (
+              <div className="flex flex-col items-center gap-6 rounded-2xl border border-zinc-200 bg-white p-6 shadow-xl dark:border-zinc-800 dark:bg-zinc-900 w-80">
+                <p className="text-sm font-semibold text-zinc-500 dark:text-zinc-400 text-center animate-pulse">
+                  {micState === 'testing' ? 'Speak something...' : 'Mic is working!'}
+                </p>
+
+                {/* Animated Sound Bars */}
+                <div className="flex items-end justify-center gap-1.5 h-16 w-full px-4">
+                  {audioLevels.map((level, i) => (
+                    <div
+                      key={i}
+                      className="w-2 rounded-full bg-teal-500 transition-all duration-75"
+                      style={{ height: `${level}%` }}
+                    />
+                  ))}
+                </div>
+
+                {micState === 'ready' ? (
+                  <button
+                    onClick={handleDoneTesting}
+                    className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-teal-600 py-3 text-base font-semibold text-white shadow-md transition hover:bg-teal-700"
+                  >
+                    Done
+                  </button>
+                ) : (
+                  <button
+                    disabled
+                    className="w-full inline-flex items-center justify-center gap-2 rounded-xl bg-zinc-100 py-3 text-base font-semibold text-zinc-400 dark:bg-zinc-800 dark:text-zinc-500"
+                  >
+                    Waiting for voice input...
+                  </button>
+                )}
+              </div>
+            )}
+
+            {error && <p className="max-w-md text-center text-sm text-red-600 dark:text-red-300">{error}</p>}
+            {!speech.microphoneAvailable && micState === 'idle' && (
+              <p className="max-w-md text-center text-sm text-red-600 dark:text-red-300">Microphone permission is unavailable.</p>
+            )}
+          </div>
         </main>
       ) : (
         <main className={`w-full flex h-screen overflow-hidden flex-row`}>

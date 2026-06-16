@@ -9,11 +9,13 @@ export function useSpeechInput(enabled: boolean, onFinalTranscript: (text: strin
     useBrowserSpeechRecognition()
 
   useEffect(() => {
-    setInterimText(interimTranscript)
+    setInterimText(interimTranscript);
+    //console.log('interim transcript', interimTranscript);
   }, [interimTranscript, setInterimText])
 
   useEffect(() => {
     const text = finalTranscript.trim()
+    //console.log('final transcript', finalTranscript);
     if (!enabled || !text || text === finalTranscriptRef.current) return
     finalTranscriptRef.current = text
     onFinalTranscript(text)
