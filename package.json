@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev:worker": "wrangler dev --local",
+    "dev:worker": "wrangler dev",
     "dev:client": "vite",
     "dev": "concurrently -n worker,client -c cyan,magenta \"npm run dev:worker\" \"npm run dev:client\"",
     "build": "vite build",

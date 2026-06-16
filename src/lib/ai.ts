@@ -5,13 +5,19 @@ import { chatgpt_ai_system_prompt } from './example-system-prompts'
 const default_systemPrompt = chatgpt_ai_system_prompt;
 
 export async function* runLLM(ai: Ai, history: Message[], config: AiConfig): AsyncGenerator<string, string> {
-  const result = (await ai.run('@cf/openai/gpt-oss-20b', {
-    messages: [{ role: 'system', content: default_systemPrompt }, ...history],
-    max_tokens: 300,
-    temperature: 0.7
-  })) as any;
+  let result: any;
+  try {
+    result = (await ai.run('@cf/openai/gpt-oss-20b', {
+      messages: [{ role: 'system', content: default_systemPrompt }, ...history],
+      max_tokens: 300,
+      temperature: 0.7
+    })) as any;
+  } catch (error) {
+    console.error('LLM generation failed:', error);
+    throw new Error('LLM service unavailable. Please try again.');
+  }
 
-  const response = (result?.response ?? '').trim()
+  const response = (result?.choices?.[0]?.message?.content ?? result?.response ?? '').trim()
   const chunks = response.match(/\S+\s*/g) ?? [response]
 
   for (const chunk of chunks) {
@@ -22,21 +28,26 @@ export async function* runLLM(ai: Ai, history: Message[], config: AiConfig): Asy
 }
 
 export async function runTTS(ai: Ai, text: string) {
-  const result = (await ai.run(
-    '@cf/deepgram/aura-1',
-    {
-      text,
-      speaker: 'asteria',
-      encoding: 'mp3',
-    },
-    {
-      returnRawResponse: true,
-    },
-  )) as unknown
+  try {
+    const result = (await ai.run(
+      '@cf/deepgram/aura-1',
+      {
+        text,
+        speaker: 'asteria',
+        encoding: 'mp3',
+      },
+      {
+        returnRawResponse: true,
+      },
+    )) as unknown
 
-  return {
-    data: await audioResultToBase64(result),
-    format: 'mp3',
+    return {
+      data: await audioResultToBase64(result),
+      format: 'mp3',
+    }
+  } catch (error) {
+    console.error('TTS synthesis failed:', error);
+    throw new Error('TTS service failed to generate audio.');
   }
 }
 
